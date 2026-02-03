@@ -1,0 +1,382 @@
+// src/store.ts
+import { create } from "zustand";
+import { api } from "./api";
+import type { ApiNode } from "./api";
+
+/* =========================
+ * Types
+ * ========================= */
+
+export type UiNode = {
+  id: string;
+  parentId: string | null;
+  content: string; // HTML string
+  orderIndex: number;
+  children: string[];
+  hasChildren?: boolean;
+  isCollapsed?: boolean;
+};
+
+const AUTH_KEY = "bulletp_auth_v1";
+
+/* =========================
+ * Store shape
+ * ========================= */
+
+type Store = {
+  // ---------- auth ----------
+  userId: string | null;
+  email: string | null;
+  homeId: string | null;
+
+  hydrateAuth: () => void;
+  setAuth: (userId: string, homeId: string, email?: string) => void;
+  clearAuth: () => void;
+
+  // bump on every login/logout to invalidate in-flight async
+  sessionNonce: number;
+
+  // ---------- data ----------
+  nodes: Record<string, UiNode>;
+  rootId: string;
+  focusedId: string | null;
+
+  sidebarVersion: number;
+  bumpSidebar: () => void;
+
+  caretToEndId: string | null;
+  setCaretToEndId: (id: string | null) => void;
+
+  init: () => Promise<void>;
+  hydrateNode: (n: ApiNode) => void;
+  loadChildren: (parentId: string) => Promise<void>;
+
+  ensureNodeLoaded: (id: string) => Promise<void>;
+  _inflightNodeFetch: Record<string, Promise<void>>;
+
+  setRootId: (id: string) => void;
+  setFocusedId: (id: string | null) => void;
+  getPathToRoot: (id: string) => string[];
+
+  toggleCollapse: (id: string) => void;
+
+  updateContent: (id: string, html: string) => Promise<void>;
+  appendChild: (parentId: string) => Promise<void>;
+  createAfter: (id: string) => Promise<void>;
+  deleteIfEmpty: (id: string) => Promise<void>;
+  indent: (id: string) => Promise<void>;
+  outdent: (id: string) => Promise<void>;
+
+  moveFocusUp: () => void;
+  moveFocusDown: () => void;
+};
+
+/* =========================
+ * Helpers
+ * ========================= */
+
+function upsertFromApi(state: Store, n: ApiNode): UiNode {
+  const existing = state.nodes[n.id];
+  const hintHasChildren =
+    (n as any).has_children !== undefined ? Boolean((n as any).has_children) : undefined;
+
+  const shouldDefaultCollapsed =
+    hintHasChildren === true && (existing?.children?.length ?? 0) === 0;
+
+  return {
+    id: n.id,
+    parentId: n.parent_id,
+    content: n.text ?? existing?.content ?? "",
+    orderIndex: n.order_index ?? existing?.orderIndex ?? 0,
+    children: existing?.children ?? [],
+    hasChildren: hintHasChildren ?? existing?.hasChildren,
+    isCollapsed:
+      existing?.isCollapsed !== undefined ? existing.isCollapsed : shouldDefaultCollapsed,
+  };
+}
+
+/* =========================
+ * Store
+ * ========================= */
+
+export const useStore = create<Store>((set, get) => ({
+  // ===== auth =====
+  userId: null,
+  email: null,
+  homeId: null,
+
+  sessionNonce: 0,
+
+  hydrateAuth: () => {
+    const raw = localStorage.getItem(AUTH_KEY);
+    if (!raw) return;
+
+    try {
+      const obj = JSON.parse(raw);
+      if (obj?.userId && obj?.homeId) {
+        set((s) => ({
+          userId: obj.userId,
+          email: obj.email ?? null,
+          homeId: obj.homeId,
+          rootId: obj.homeId,
+          sessionNonce: s.sessionNonce + 1,
+        }));
+      }
+    } catch {
+      /* ignore */
+    }
+  },
+
+  setAuth: (userId, homeId, email) => {
+    localStorage.setItem(AUTH_KEY, JSON.stringify({ userId, homeId, email }));
+
+    set((s) => ({
+      userId,
+      email: email ?? null,
+      homeId,
+      rootId: homeId,
+      focusedId: null,
+      sessionNonce: s.sessionNonce + 1,
+    }));
+  },
+
+  clearAuth: () => {
+    localStorage.removeItem(AUTH_KEY);
+
+    set((s) => ({
+      userId: null,
+      email: null,
+      homeId: null,
+      nodes: {},
+      rootId: "",
+      focusedId: null,
+      caretToEndId: null,
+      _inflightNodeFetch: {},
+      sidebarVersion: 0,
+      sessionNonce: s.sessionNonce + 1,
+    }));
+  },
+
+  // ===== data =====
+  nodes: {},
+  rootId: "",
+  focusedId: null,
+
+  sidebarVersion: 0,
+  bumpSidebar: () => set((s) => ({ sidebarVersion: s.sidebarVersion + 1 })),
+
+  caretToEndId: null,
+  setCaretToEndId: (id) => set({ caretToEndId: id }),
+
+  _inflightNodeFetch: {},
+
+  init: async () => {
+    const { userId } = get();
+    if (!userId) return; // 🔒 未登录不允许 init
+
+    const nonce = get().sessionNonce;
+    const home = await api.getHome();
+
+    if (get().sessionNonce !== nonce) return;
+
+    set((s) => {
+      const next = { ...s.nodes };
+      next[home.id] = {
+        id: home.id,
+        parentId: null,
+        content: home.text ?? "Home",
+        orderIndex: 0,
+        children: [],
+        hasChildren: true,
+        isCollapsed: false,
+      };
+      return { nodes: next, homeId: home.id, rootId: home.id };
+    });
+
+    await get().loadChildren(home.id);
+  },
+
+  hydrateNode: (n) =>
+    set((s) => ({
+      nodes: { ...s.nodes, [n.id]: upsertFromApi(s as any, n) },
+    })),
+
+  ensureNodeLoaded: async (id) => {
+    if (!id) return;
+
+    const nonce = get().sessionNonce;
+    const st = get();
+
+    if (st.nodes[id]?.content !== undefined) return;
+
+    if (st._inflightNodeFetch[id]) {
+      await st._inflightNodeFetch[id];
+      return;
+    }
+
+    const p = (async () => {
+      try {
+        const n = await api.getNode(id);
+        if (get().sessionNonce !== nonce) return;
+        st.hydrateNode(n);
+      } finally {
+        set((s) => {
+          const next = { ...s._inflightNodeFetch };
+          delete next[id];
+          return { _inflightNodeFetch: next };
+        });
+      }
+    })();
+
+    set((s) => ({
+      _inflightNodeFetch: { ...s._inflightNodeFetch, [id]: p },
+    }));
+
+    await p;
+  },
+
+  loadChildren: async (parentId) => {
+    const nonce = get().sessionNonce;
+    const rows = await api.getChildren(parentId);
+    if (get().sessionNonce !== nonce) return;
+
+    set((s) => {
+      const next = { ...s.nodes };
+      const childIds: string[] = [];
+
+      for (const r of rows) {
+        next[r.id] = upsertFromApi(s as any, r);
+        childIds.push(r.id);
+      }
+
+      next[parentId] = {
+        ...next[parentId],
+        children: childIds,
+        hasChildren: childIds.length > 0,
+      };
+
+      return { nodes: next };
+    });
+  },
+
+  setRootId: (id) => {
+    set({ rootId: id });
+    get().ensureNodeLoaded(id).catch(console.error);
+  },
+
+  setFocusedId: (id) => set({ focusedId: id }),
+
+  getPathToRoot: (id) => {
+    const { nodes, homeId } = get();
+    const path: string[] = [];
+    let cur: string | null = id;
+
+    while (cur) {
+      path.push(cur);
+      cur = nodes[cur]?.parentId ?? null;
+    }
+
+    path.reverse();
+    return homeId && path[0] !== homeId ? [homeId, ...path] : path;
+  },
+
+  toggleCollapse: (id) => {
+    set((s) => {
+      const n = s.nodes[id];
+      if (!n) return s;
+      return { nodes: { ...s.nodes, [id]: { ...n, isCollapsed: !n.isCollapsed } } };
+    });
+
+    const n = get().nodes[id];
+    if (n && !n.isCollapsed && n.children.length === 0) {
+      get().loadChildren(id).catch(console.error);
+    }
+  },
+
+  updateContent: async (id, html) => {
+    const nonce = get().sessionNonce;
+    const updated = await api.patchNode(id, { text: html });
+    if (get().sessionNonce !== nonce) return;
+
+    set((s) => ({
+      nodes: { ...s.nodes, [id]: upsertFromApi(s as any, updated) },
+    }));
+
+    get().bumpSidebar();
+  },
+
+  appendChild: async (parentId) => {
+    const nonce = get().sessionNonce;
+    await api.createNode({ parent_id: parentId, text: "" });
+    if (get().sessionNonce !== nonce) return;
+    await get().loadChildren(parentId);
+    get().bumpSidebar();
+  },
+
+  createAfter: async (id) => {
+    const nonce = get().sessionNonce;
+    const st = get();
+    const node = st.nodes[id];
+    if (!node) return;
+
+    const parentId = node.parentId ?? st.homeId;
+    if (!parentId) return;
+
+    const created = await api.createNode({ parent_id: parentId, text: "" });
+    if (get().sessionNonce !== nonce) return;
+
+    await st.loadChildren(parentId);
+    const idx = st.nodes[parentId].children.indexOf(id) + 1;
+
+    await api.moveNode(created.id, {
+      new_parent_id: parentId,
+      new_order_index: idx,
+    });
+
+    await st.loadChildren(parentId);
+    set({ focusedId: created.id });
+    get().bumpSidebar();
+  },
+
+  deleteIfEmpty: async (id) => {
+    const nonce = get().sessionNonce;
+    const st = get();
+    const node = st.nodes[id];
+    if (!node?.parentId) return;
+
+    await api.deleteNode(id);
+    if (get().sessionNonce !== nonce) return;
+
+    await st.loadChildren(node.parentId);
+    set((s) => {
+      const next = { ...s.nodes };
+      delete next[id];
+      return { nodes: next };
+    });
+
+    get().bumpSidebar();
+  },
+
+  indent: async (id) => {
+    const nonce = get().sessionNonce;
+    const updated = await api.indentNode(id);
+    if (get().sessionNonce !== nonce) return;
+
+    get().hydrateNode(updated);
+    await get().loadChildren(updated.parent_id!);
+    get().bumpSidebar();
+  },
+
+  outdent: async (id) => {
+    const nonce = get().sessionNonce;
+    const updated = await api.outdentNode(id);
+    if (get().sessionNonce !== nonce) return;
+
+    get().hydrateNode(updated);
+    await get().loadChildren(updated.parent_id!);
+    get().bumpSidebar();
+  },
+
+  moveFocusUp: () => {},
+  moveFocusDown: () => {},
+}));

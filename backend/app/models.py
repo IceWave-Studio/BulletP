@@ -26,7 +26,7 @@ def gen_uuid() -> str:
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(String, primary_key=True, default=gen_uuid)
+    id = Column(String(36), primary_key=True, default=gen_uuid)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     identities = relationship(
@@ -46,11 +46,11 @@ class Identity(Base):
 
     __tablename__ = "identities"
 
-    id = Column(String, primary_key=True, default=gen_uuid)
+    id = Column(String(36), primary_key=True, default=gen_uuid)
 
-    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
-    provider = Column(String, nullable=False)
-    provider_subject = Column(String, nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
+    provider = Column(String(36), nullable=False)
+    provider_subject = Column(String(36), nullable=False)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -65,13 +65,13 @@ class Identity(Base):
 class Bullet(Base):
     __tablename__ = "bullets"
 
-    id = Column(String, primary_key=True, default=gen_uuid)
+    id = Column(String(36), primary_key=True, default=gen_uuid)
 
-    user_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
 
-    parent_id = Column(String, ForeignKey("bullets.id"), nullable=True, index=True)
+    parent_id = Column(String(36), ForeignKey("bullets.id"), nullable=True, index=True)
 
-    text = Column(String, nullable=False, default="")
+    text = Column(Text, nullable=False, default="")
     order_index = Column(Integer, nullable=False, default=0)
 
     # ✅ root 标记（SQLite-friendly）
@@ -98,10 +98,20 @@ class Bullet(Base):
 class EmailOTP(Base):
     __tablename__ = "email_otps"
 
-    id = Column(String, primary_key=True, default=gen_uuid)
+    id = Column(String(36), primary_key=True, default=gen_uuid)
 
-    email = Column(String, nullable=False, index=True)
-    code = Column(String, nullable=False)  # 开发期明文存，后面可改 hash
+    # ✅ email 必须够长
+    email = Column(String(255), nullable=False, index=True)
+
+    # ⚠️ 兼容旧数据：先保留 code（后面稳定了可以删）
+    code = Column(String(36), nullable=True)
+
+    # ✅ 上线用：存 hash，不存明文
+    code_hash = Column(String(64), nullable=True)
+
+    # ✅ 限流/风控用：记录请求 IP（IPv4/IPv6）
+    ip = Column(String(45), nullable=True, index=True)
+
     expires_at = Column(DateTime, nullable=False)
     consumed_at = Column(DateTime, nullable=True)
 
@@ -109,15 +119,15 @@ class EmailOTP(Base):
 
     __table_args__ = (
         Index("ix_email_otps_email_expires", "email", "expires_at"),
+        Index("ix_email_otps_ip_created", "ip", "created_at"),
     )
-
 
 class WeChatLoginState(Base):
     __tablename__ = "wechat_login_states"
 
-    id = Column(String, primary_key=True, default=gen_uuid)
+    id = Column(String(36), primary_key=True, default=gen_uuid)
 
-    state = Column(String, nullable=False, unique=True, index=True)
+    state = Column(String(36), nullable=False, unique=True, index=True)
     expires_at = Column(DateTime, nullable=False)
     consumed_at = Column(DateTime, nullable=True)
 

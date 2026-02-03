@@ -1,6 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 from typing import Optional
+
+from .emailer import send_verification_email
+from .otp import gen_code, hash_code, verify_code
 
 from sqlalchemy import select, update, and_
 from sqlalchemy.orm import Session
@@ -73,8 +76,17 @@ class EmailVerifyIn(BaseModel):
     email: str
     code: str
 
-def gen_otp_code() -> str:
-    return f"{random.randint(0, 999999):06d}"
+OTP_EXPIRE_SECONDS = int(os.getenv("OTP_EXPIRE_SECONDS", "600"))
+OTP_COOLDOWN_SECONDS = int(os.getenv("OTP_COOLDOWN_SECONDS", "60"))
+OTP_IP_LIMIT_PER_HOUR = int(os.getenv("OTP_IP_LIMIT_PER_HOUR", "20"))
+
+def get_client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
 
 app = FastAPI(title="BulletP Backend")
 
@@ -90,8 +102,7 @@ app.add_middleware(
 )
 
 
-# main.py
-import os
+
 
 # ✅ 只在开发环境自动建表；生产环境请用 Alembic 或手动迁移
 ENV = os.getenv("ENV", "dev").lower()
@@ -270,6 +281,110 @@ def build_subtree(db: Session, user_id: str, root_id: str, depth: int):
 def root():
     return {"name": "BulletP Backend", "status": "running", "docs": "/docs"}
 
+@app.post("/api/auth/email/start")
+def email_start(payload: EmailStartIn, background_tasks: BackgroundTasks, request: Request):
+    email = (payload.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="invalid email")
+
+    ip = get_client_ip(request)
+    now = datetime.utcnow()
+
+    db = SessionLocal()
+    try:
+        with db.begin():
+            # 1) 邮箱冷却：最近一次发送 < cooldown 秒则拒绝
+            last = db.execute(
+                select(EmailOTP)
+                .where(EmailOTP.email == email)
+                .order_by(EmailOTP.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            if last is not None:
+                delta = (now - last.created_at).total_seconds()
+                if delta < OTP_COOLDOWN_SECONDS:
+                    raise HTTPException(status_code=429, detail="too frequent, try later")
+
+            # 2) IP 限流：过去 1 小时内同 IP 次数
+            one_hour_ago = now - timedelta(hours=1)
+            ip_count = db.execute(
+                select(EmailOTP.id)
+                .where(
+                    EmailOTP.ip == ip,
+                    EmailOTP.created_at >= one_hour_ago,
+                )
+            ).scalars().all()
+            if len(ip_count) >= OTP_IP_LIMIT_PER_HOUR:
+                raise HTTPException(status_code=429, detail="rate limit")
+
+            # 3) 生成验证码并入库（只存 hash）
+            code = gen_code()
+            row = EmailOTP(
+                id=gen_uuid(),
+                email=email,
+                code=None,                  # 旧字段不再使用
+                code_hash=hash_code(code),  # ✅ 只存 hash
+                ip=ip,
+                expires_at=now + timedelta(seconds=OTP_EXPIRE_SECONDS),
+                consumed_at=None,
+            )
+            db.add(row)
+
+        # 4) 后台发邮件（不阻塞请求）
+        background_tasks.add_task(send_verification_email, email, code)
+
+        return {"ok": True}
+    finally:
+        db.close()
+
+@app.post("/api/auth/email/verify")
+def email_verify(payload: EmailVerifyIn):
+    email = (payload.email or "").strip().lower()
+    code = (payload.code or "").strip()
+    if not email or not code:
+        raise HTTPException(status_code=400, detail="missing email/code")
+
+    now = datetime.utcnow()
+
+    db = SessionLocal()
+    try:
+        with db.begin():
+            row = db.execute(
+                select(EmailOTP)
+                .where(
+                    EmailOTP.email == email,
+                    EmailOTP.consumed_at.is_(None),
+                )
+                .order_by(EmailOTP.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            if row is None:
+                raise HTTPException(status_code=400, detail="code not found")
+
+            if row.expires_at <= now:
+                raise HTTPException(status_code=400, detail="code expired")
+
+            # ✅ 新逻辑：hash 校验；兼容旧数据：如果 code_hash 为空就退回明文比对
+            ok = False
+            if row.code_hash:
+                ok = verify_code(code, row.code_hash)
+            elif row.code:
+                ok = (code == row.code)
+
+            if not ok:
+                raise HTTPException(status_code=400, detail="invalid code")
+
+            row.consumed_at = now
+
+            # 登录成功：创建/获取 user + identity，并确保 home 存在
+            user = get_or_create_user_by_identity(db, "email", email)
+            home = ensure_home(db, user.id)
+
+        return {"ok": True, "user_id": user.id, "home_id": home.id}
+    finally:
+        db.close()
 
 @app.post("/api/dev/bootstrap")
 def dev_bootstrap(payload: BootstrapReq):

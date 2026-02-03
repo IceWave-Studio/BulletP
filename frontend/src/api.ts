@@ -1,5 +1,7 @@
 // src/api.ts
 
+import { useStore } from "./store";
+
 /** =========================
  * Types
  * ========================= */
@@ -33,26 +35,16 @@ export type EmailVerifyRes = {
  * ========================= */
 
 // 本地默认走 Vite proxy（API_BASE=""）
-// 生产环境可用 VITE_API_BASE=https://api.xxx.com
+// 生产环境可用 VITE_API_BASE=https://xxx
 const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
-
-// 与 store.ts 约定的 key
-const AUTH_KEY = "bulletp_auth_v1";
 
 /** =========================
  * Helpers
  * ========================= */
 
-// 从 localStorage 里取 userId
-function getStoredUserId(): string | null {
-  try {
-    const raw = localStorage.getItem(AUTH_KEY);
-    if (!raw) return null;
-    const obj = JSON.parse(raw);
-    return obj?.userId ?? null;
-  } catch {
-    return null;
-  }
+// ✅ 从 Zustand store 读取当前 userId（唯一事实源）
+function getCurrentUserId(): string | null {
+  return useStore.getState().userId;
 }
 
 // 对需要“用户隔离”的 API 自动拼 user_id
@@ -62,7 +54,7 @@ function withUserId(path: string): string {
     return path;
   }
 
-  const userId = getStoredUserId();
+  const userId = getCurrentUserId();
   if (!userId) return path;
 
   const sep = path.includes("?") ? "&" : "?";
@@ -90,7 +82,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const finalPath = withUserId(path);
   const url = `${API_BASE}${finalPath}`;
 
-  // ✅ 只在需要时设置 Content-Type，避免 GET 也触发 preflight（Edge 更容易出坑）
+  // ✅ 只在有 body 时设置 Content-Type，避免 GET 触发 preflight
   const headers: Record<string, string> = {
     ...(init?.headers as any),
   };
@@ -112,7 +104,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // 204 No Content
   if (res.status === 204) return undefined as T;
 
-  // 有些接口可能返回 text/plain（比如 CORS OK），这里兜底一下
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("application/json")) {
     return (await res.text()) as T;
