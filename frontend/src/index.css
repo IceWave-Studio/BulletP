@@ -1,0 +1,143 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===============================
+   Row hover（可选，极轻）
+   =============================== */
+.bp-row:hover {
+  background: rgba(243, 244, 246, 0.7); /* gray-100 */
+}
+
+/* ===============================
+   contentEditable 基础清理
+   =============================== */
+.bp-editor,
+.bp-editor:focus,
+.bp-editor:focus-visible {
+  outline: none !important;
+  border: none !important;
+  box-shadow: none !important;
+  background: transparent;
+}
+
+/* 空行占位（不显示，只保高度） */
+.bp-editor:empty::before {
+  content: attr(data-placeholder);
+  opacity: 0;
+  white-space: pre;
+}
+
+/* 禁止浏览器插入 block 破坏一行 */
+.bp-editor div,
+.bp-editor p {
+  display: inline;
+  margin: 0;
+}
+
+/* strong 仅表现为字重 */
+.bp-editor strong {
+  font-weight: 800;
+}
+
+/* ===============================
+   正文编辑字体（你偏好的那版）
+   =============================== */
+.bp-editor {
+  font-family: ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", "Liberation Sans", sans-serif;
+
+  font-size: 20px;
+  line-height: 32px;
+  font-weight: 500;            /* 关键：不是 600，接近你图二 */
+  color: #111827;              /* gray-900 */
+
+  padding: 0;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ===============================
+   Bullet 外圈（状态全在这里）
+   =============================== */
+.bp-bullet-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 24px;
+  height: 24px;
+  border-radius: 9999px;
+
+  background: transparent;                 /* 默认：无背景 */
+  transition: background-color 120ms ease;
+
+  cursor: pointer;
+}
+
+/* ✅ 有子项 且 折叠：常驻浅灰背景 */
+.bp-bullet-wrap.bp-bullet-collapsed {
+  background: #E5E7EB;                     /* gray-200 */
+}
+
+/* ✅ hover：任何状态 → 更深灰（覆盖上面） */
+.bp-bullet-wrap:hover {
+  background: #D1D5DB;                     /* gray-300 */
+}
+
+/* ===============================
+   Bullet dot 本体（永远不变）
+   =============================== */
+.bp-bullet-dot {
+  display: block;
+  fill: #4B5563;                           /* gray-600，永远固定 */
+}
+
+/* ===============================
+   Button reset
+   =============================== */
+button {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+button:focus {
+  outline: none;
+}
+
+/* ===============================
+   Title（页面标题，编辑态）
+   =============================== */
+.bp-title-editor {
+  font-family: ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", "Liberation Sans", sans-serif;
+
+  font-weight: 600;
+  color: #111827;
+
+  font-size: 64px;             /* 你当前用的尺寸 */
+  line-height: 1.05;
+
+  background: transparent;
+  outline: none;
+  margin: 0;
+  padding: 0;
+
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 防止标题被浏览器插 block */
+.bp-title-editor div,
+.bp-title-editor p {
+  display: inline;
+  margin: 0;
+}
+
+.bp-title-editor strong {
+  font-weight: 800;
+}
