@@ -1,3 +1,4 @@
+# backend/app/models.py
 import uuid
 from datetime import datetime
 
@@ -10,13 +11,11 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     Index,
+    Text,
 )
 from sqlalchemy.orm import relationship
 
 from .database import Base
-
-from sqlalchemy import Text
-
 
 
 def gen_uuid() -> str:
@@ -41,7 +40,9 @@ class Identity(Base):
     """
     登录方式映射表：
     - provider: "wechat" / "email"
-    - provider_subject: wechat=open_id/unionid, email=lowercase email
+    - provider_subject:
+        - wechat: openid / unionid（长度可能 > 36）
+        - email : lowercase email（长度可能接近 255）
     """
 
     __tablename__ = "identities"
@@ -50,7 +51,9 @@ class Identity(Base):
 
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     provider = Column(String(36), nullable=False)
-    provider_subject = Column(String(36), nullable=False)
+
+    # ✅ 由 String(36) 改为 String(255)（否则 email/unionid 可能截断）
+    provider_subject = Column(String(255), nullable=False)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -68,15 +71,14 @@ class Bullet(Base):
     id = Column(String(36), primary_key=True, default=gen_uuid)
 
     user_id = Column(String(36), ForeignKey("users.id"), nullable=False, index=True)
-
     parent_id = Column(String(36), ForeignKey("bullets.id"), nullable=True, index=True)
 
     text = Column(Text, nullable=False, default="")
     order_index = Column(Integer, nullable=False, default=0)
 
-    # ✅ root 标记（SQLite-friendly）
-    # root: True
-    # others: NULL (allows many NULLs)
+    # ✅ root 标记
+    # 规则：root 用 True；普通节点用 None（不要写 False）
+    # 这样配合 UniqueConstraint(user_id, is_root) 可实现 “每个 user 只有一个 root”
     is_root = Column(Boolean, nullable=True, default=None)
 
     is_deleted = Column(Boolean, nullable=False, default=False)
@@ -93,23 +95,24 @@ class Bullet(Base):
         # ✅ 每个 user 只能有一个 is_root=True；NULL 不受限
         UniqueConstraint("user_id", "is_root", name="uq_user_root"),
         Index("ix_bullets_user_parent_order", "user_id", "parent_id", "order_index"),
+        Index("ix_bullets_user_root", "user_id", "is_root"),
     )
+
 
 class EmailOTP(Base):
     __tablename__ = "email_otps"
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
 
-    # ✅ email 必须够长
     email = Column(String(255), nullable=False, index=True)
 
-    # ⚠️ 兼容旧数据：先保留 code（后面稳定了可以删）
-    code = Column(String(36), nullable=True)
+    # ⚠️ 兼容旧数据：保留 code，但长度用 6 更合理（验证码就是 6 位）
+    code = Column(String(6), nullable=True)
 
-    # ✅ 上线用：存 hash，不存明文
+    # ✅ 存 hash（sha256 hex = 64）
     code_hash = Column(String(64), nullable=True)
 
-    # ✅ 限流/风控用：记录请求 IP（IPv4/IPv6）
+    # ✅ 限流/风控：IPv4/IPv6
     ip = Column(String(45), nullable=True, index=True)
 
     expires_at = Column(DateTime, nullable=False)
@@ -121,6 +124,7 @@ class EmailOTP(Base):
         Index("ix_email_otps_email_expires", "email", "expires_at"),
         Index("ix_email_otps_ip_created", "ip", "created_at"),
     )
+
 
 class WeChatLoginState(Base):
     __tablename__ = "wechat_login_states"
