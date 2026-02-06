@@ -1,30 +1,15 @@
-# =============================
-# Load env FIRST (VERY IMPORTANT)
-# =============================
 import os
-from pathlib import Path
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from typing import Optional
+from urllib.parse import urlencode
 
-ENV = os.getenv("ENV", "dev").lower()
-
-# Always load env from backend/.env.{ENV}
-BACKEND_DIR = Path(__file__).resolve().parents[1]  # .../backend
-load_dotenv(BACKEND_DIR / f".env.{ENV}")
-
-# =============================
-# Standard imports
-# =============================
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime, timedelta
-from urllib.parse import urlencode
 
 from sqlalchemy import select, update, and_
 from sqlalchemy.orm import Session
 
-# Local imports (after env loaded!)
 from .database import Base, engine, SessionLocal
 from .models import (
     User,
@@ -37,20 +22,20 @@ from .models import (
 from .emailer import send_verification_email
 from .otp import gen_code, hash_code, verify_code
 
+
 # =============================
 # App init
 # =============================
 app = FastAPI(title="BulletP Backend")
 
 # =============================
-# CORS (env-based)
+# CORS
 # =============================
 cors = os.getenv("CORS_ORIGINS", "")
 allow_origins = [x.strip() for x in cors.split(",") if x.strip()] or [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -59,11 +44,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ✅ 只在开发环境自动建表；生产环境请用 Alembic
+ENV = os.getenv("ENV", "dev").lower()
+if ENV != "prod":
+    Base.metadata.create_all(bind=engine)
 
-
-# =============================
-# Constants
-# =============================
 DEFAULT_USER = "default"
 HOME_TEXT = "Home"
 
@@ -73,7 +58,7 @@ OTP_IP_LIMIT_PER_HOUR = int(os.getenv("OTP_IP_LIMIT_PER_HOUR", "20"))
 
 WECHAT_APPID = os.getenv("WECHAT_APPID", "")
 WECHAT_SECRET = os.getenv("WECHAT_SECRET", "")
-WECHAT_REDIRECT_URI = os.getenv("WECHAT_REDIRECT_URI", "")  # e.g. https://xxx.com/api/auth/wechat/callback
+WECHAT_REDIRECT_URI = os.getenv("WECHAT_REDIRECT_URI", "")
 
 
 # =============================
@@ -82,29 +67,29 @@ WECHAT_REDIRECT_URI = os.getenv("WECHAT_REDIRECT_URI", "")  # e.g. https://xxx.c
 class EmailStartIn(BaseModel):
     email: str
 
+
 class EmailVerifyIn(BaseModel):
     email: str
     code: str
 
-class WeChatQRStartOut(BaseModel):
-    state: str
-    qr_url: str
-    expires_in: int
 
 class CreateNodeIn(BaseModel):
     parent_id: Optional[str] = None
     text: str = ""
 
+
 class UpdateNodeIn(BaseModel):
     text: str
+
 
 class MoveNodeIn(BaseModel):
     new_parent_id: str
     new_order_index: int
 
+
 class BootstrapReq(BaseModel):
     provider: str   # "email" / "wechat"
-    subject: str    # email 或 openid/unionid
+    subject: str    # email/openid/unionid
 
 
 # =============================
@@ -118,8 +103,10 @@ def get_client_ip(request: Request) -> str:
         return request.client.host
     return "unknown"
 
+
 def norm_user_id(user_id: Optional[str]) -> str:
     return (user_id or DEFAULT_USER).strip() or DEFAULT_USER
+
 
 def ensure_user_exists(db: Session, user_id: str):
     u = db.get(User, user_id)
@@ -128,6 +115,7 @@ def ensure_user_exists(db: Session, user_id: str):
         db.add(u)
         db.flush()
     return u
+
 
 def ensure_home(db: Session, user_id: str) -> Bullet:
     user_id = norm_user_id(user_id)
@@ -158,6 +146,7 @@ def ensure_home(db: Session, user_id: str) -> Bullet:
         db.flush()
 
     return home
+
 
 def get_or_create_user_by_identity(db: Session, provider: str, subject: str) -> User:
     provider = (provider or "").strip()
@@ -195,6 +184,7 @@ def get_or_create_user_by_identity(db: Session, provider: str, subject: str) -> 
 
     ensure_home(db, user.id)
     return user
+
 
 def build_subtree(db: Session, user_id: str, root_id: str, depth: int):
     user_id = norm_user_id(user_id)
@@ -244,9 +234,28 @@ def build_subtree(db: Session, user_id: str, root_id: str, depth: int):
 
     return build(root, depth)
 
+
+def _max_order(db: Session, user_id: str, parent_id: Optional[str]) -> int:
+    max_order = db.execute(
+        select(Bullet.order_index)
+        .where(
+            Bullet.user_id == user_id,
+            Bullet.parent_id == parent_id,
+            Bullet.is_deleted == False,
+        )
+        .order_by(Bullet.order_index.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    return int(max_order) if max_order is not None else -1
+
+
+# =============================
+# WeChat helpers
+# =============================
 def require_wechat_config():
     if not WECHAT_APPID or not WECHAT_REDIRECT_URI:
         raise HTTPException(status_code=500, detail="WECHAT_APPID/WECHAT_REDIRECT_URI not configured")
+
 
 def create_wechat_state(db: Session) -> str:
     state = gen_uuid()
@@ -259,6 +268,7 @@ def create_wechat_state(db: Session) -> str:
     db.add(row)
     db.flush()
     return state
+
 
 def consume_wechat_state(db: Session, state: str):
     row = db.execute(
@@ -286,6 +296,9 @@ def root():
     return {"name": "BulletP Backend", "status": "running", "docs": "/docs"}
 
 
+# -----------------------------
+# Auth - Email OTP (ONLY ONE VERSION)
+# -----------------------------
 @app.post("/api/auth/email/start")
 def email_start(payload: EmailStartIn, background_tasks: BackgroundTasks, request: Request):
     email = (payload.email or "").strip().lower()
@@ -413,6 +426,9 @@ def get_home(user_id: Optional[str] = None):
         db.close()
 
 
+# -----------------------------
+# Nodes CRUD
+# -----------------------------
 @app.post("/api/nodes")
 def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
     db = SessionLocal()
@@ -429,18 +445,7 @@ def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
             if parent is None or parent.is_deleted or parent.user_id != user_id:
                 raise HTTPException(status_code=404, detail="parent not found")
 
-            max_order = db.execute(
-                select(Bullet.order_index)
-                .where(
-                    Bullet.user_id == user_id,
-                    Bullet.parent_id == parent_id,
-                    Bullet.is_deleted == False,
-                )
-                .order_by(Bullet.order_index.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-
-            order_index = (max_order + 1) if max_order is not None else 0
+            order_index = _max_order(db, user_id, parent_id) + 1
 
             node = Bullet(
                 id=gen_uuid(),
@@ -515,6 +520,26 @@ def get_children(parent_id: str, user_id: Optional[str] = None):
         db.close()
 
 
+@app.get("/api/nodes/{node_id}")
+def get_node(node_id: str, user_id: Optional[str] = None):
+    db = SessionLocal()
+    try:
+        user_id = norm_user_id(user_id)
+        node = db.get(Bullet, node_id)
+        if node is None or node.is_deleted or node.user_id != user_id:
+            raise HTTPException(status_code=404, detail="node not found")
+
+        return {
+            "id": node.id,
+            "parent_id": node.parent_id,
+            "text": node.text,
+            "order_index": node.order_index,
+            "user_id": node.user_id,
+        }
+    finally:
+        db.close()
+
+
 @app.patch("/api/nodes/{node_id}")
 def update_node(node_id: str, payload: UpdateNodeIn, user_id: Optional[str] = None):
     db = SessionLocal()
@@ -550,6 +575,7 @@ def delete_node(node_id: str, user_id: Optional[str] = None):
             node = db.get(Bullet, node_id)
             if node is None or node.is_deleted or node.user_id != user_id:
                 raise HTTPException(status_code=404, detail="node not found")
+
             if node.is_root is True:
                 raise HTTPException(status_code=400, detail="cannot delete root")
 
@@ -691,6 +717,141 @@ def move_node(node_id: str, payload: MoveNodeIn, user_id: Optional[str] = None):
         db.close()
 
 
+@app.post("/api/nodes/{node_id}/indent")
+def indent_node(node_id: str, user_id: Optional[str] = None):
+    db = SessionLocal()
+    try:
+        user_id = norm_user_id(user_id)
+
+        with db.begin():
+            node = db.get(Bullet, node_id)
+            if node is None or node.is_deleted or node.user_id != user_id:
+                raise HTTPException(status_code=404, detail="node not found")
+            if node.is_root is True:
+                raise HTTPException(status_code=400, detail="cannot indent root")
+            if node.parent_id is None:
+                raise HTTPException(status_code=400, detail="cannot indent top-level")
+
+            old_parent_id = node.parent_id
+            old_order = node.order_index
+
+            # ✅ FIX: nearest previous sibling (order_index < old_order)
+            prev_sibling = db.execute(
+                select(Bullet)
+                .where(
+                    Bullet.user_id == user_id,
+                    Bullet.parent_id == old_parent_id,
+                    Bullet.is_deleted == False,
+                    Bullet.order_index < old_order,
+                )
+                .order_by(Bullet.order_index.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            if prev_sibling is None:
+                raise HTTPException(status_code=400, detail="no previous sibling to indent under")
+
+            new_parent_id = prev_sibling.id
+
+            # close gap in old parent
+            db.execute(
+                update(Bullet)
+                .where(
+                    Bullet.user_id == user_id,
+                    Bullet.parent_id == old_parent_id,
+                    Bullet.is_deleted == False,
+                    Bullet.order_index > old_order,
+                )
+                .values(order_index=Bullet.order_index - 1)
+            )
+
+            # append to new parent
+            node.parent_id = new_parent_id
+            node.order_index = _max_order(db, user_id, new_parent_id) + 1
+            db.flush()
+
+        return {
+            "id": node.id,
+            "parent_id": node.parent_id,
+            "text": node.text,
+            "order_index": node.order_index,
+            "user_id": node.user_id,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/nodes/{node_id}/outdent")
+def outdent_node(node_id: str, user_id: Optional[str] = None):
+    db = SessionLocal()
+    try:
+        user_id = norm_user_id(user_id)
+
+        with db.begin():
+            node = db.get(Bullet, node_id)
+            if node is None or node.is_deleted or node.user_id != user_id:
+                raise HTTPException(status_code=404, detail="node not found")
+            if node.is_root is True:
+                raise HTTPException(status_code=400, detail="cannot outdent root")
+            if node.parent_id is None:
+                raise HTTPException(status_code=400, detail="cannot outdent top-level")
+
+            parent = db.get(Bullet, node.parent_id)
+            if parent is None or parent.is_deleted or parent.user_id != user_id:
+                raise HTTPException(status_code=404, detail="parent not found")
+
+            # ✅ FIX: cannot outdent beyond Home
+            if parent.is_root is True:
+                raise HTTPException(status_code=400, detail="cannot outdent beyond Home")
+
+            grand_parent_id = parent.parent_id
+            if grand_parent_id is None:
+                raise HTTPException(status_code=400, detail="invalid tree state")
+
+            old_parent_id = node.parent_id
+            old_order = node.order_index
+
+            insert_order = parent.order_index + 1
+
+            # close gap in old parent
+            db.execute(
+                update(Bullet)
+                .where(
+                    Bullet.user_id == user_id,
+                    Bullet.parent_id == old_parent_id,
+                    Bullet.is_deleted == False,
+                    Bullet.order_index > old_order,
+                )
+                .values(order_index=Bullet.order_index - 1)
+            )
+
+            # make space in grand parent
+            db.execute(
+                update(Bullet)
+                .where(
+                    Bullet.user_id == user_id,
+                    Bullet.parent_id == grand_parent_id,
+                    Bullet.is_deleted == False,
+                    Bullet.order_index >= insert_order,
+                )
+                .values(order_index=Bullet.order_index + 1)
+            )
+
+            node.parent_id = grand_parent_id
+            node.order_index = insert_order
+            db.flush()
+
+        return {
+            "id": node.id,
+            "parent_id": node.parent_id,
+            "text": node.text,
+            "order_index": node.order_index,
+            "user_id": node.user_id,
+        }
+    finally:
+        db.close()
+
+
 @app.get("/api/nodes/{root_id}/subtree")
 def get_subtree(root_id: str, depth: int = 5, user_id: Optional[str] = None):
     depth = max(0, min(depth, 5))
@@ -704,6 +865,9 @@ def get_subtree(root_id: str, depth: int = 5, user_id: Optional[str] = None):
         db.close()
 
 
+# -----------------------------
+# WeChat
+# -----------------------------
 @app.post("/api/auth/wechat/qr/start")
 def wechat_qr_start():
     require_wechat_config()
@@ -733,7 +897,7 @@ def wechat_callback(code: str, state: str):
         with db.begin():
             consume_wechat_state(db, state)
 
-            # TODO: real exchange
+            # TODO: 用 code 向微信换取 openid（生产必须真实换）
             openid = f"dev_openid_{code}"
 
             user = get_or_create_user_by_identity(db, "wechat", openid)
