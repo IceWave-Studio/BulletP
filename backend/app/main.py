@@ -76,6 +76,8 @@ class EmailVerifyIn(BaseModel):
 class CreateNodeIn(BaseModel):
     parent_id: Optional[str] = None
     text: str = ""
+    # ✅ 根治：插入到某个同级节点之后（同 parent_id）
+    after_id: Optional[str] = None
 
 
 class UpdateNodeIn(BaseModel):
@@ -247,6 +249,23 @@ def _max_order(db: Session, user_id: str, parent_id: Optional[str]) -> int:
         .limit(1)
     ).scalar_one_or_none()
     return int(max_order) if max_order is not None else -1
+
+
+def _shift_siblings_right(db: Session, user_id: str, parent_id: str, start_from: int):
+    """
+    ✅ 根治：为插入腾位置
+    把同一 parent 下 order_index >= start_from 的兄弟节点全部 +1
+    """
+    db.execute(
+        update(Bullet)
+        .where(
+            Bullet.user_id == user_id,
+            Bullet.parent_id == parent_id,
+            Bullet.is_deleted == False,
+            Bullet.order_index >= start_from,
+        )
+        .values(order_index=Bullet.order_index + 1)
+    )
 
 
 # =============================
@@ -431,12 +450,20 @@ def get_home(user_id: Optional[str] = None):
 # -----------------------------
 @app.post("/api/nodes")
 def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
+    """
+    ✅ 根治：支持 after_id
+    - parent_id 为空：默认插到 Home 下
+    - after_id 不为空：插到 after 节点之后（必须同一 parent）
+    - 否则：追加到末尾
+    """
     db = SessionLocal()
     try:
         user_id = norm_user_id(user_id)
         parent_id = payload.parent_id
+        after_id = payload.after_id
 
         with db.begin():
+            # parent_id None => Home 下
             if parent_id is None:
                 home = ensure_home(db, user_id)
                 parent_id = home.id
@@ -445,7 +472,19 @@ def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
             if parent is None or parent.is_deleted or parent.user_id != user_id:
                 raise HTTPException(status_code=404, detail="parent not found")
 
-            order_index = _max_order(db, user_id, parent_id) + 1
+            # ✅ 核心：计算插入位置
+            if after_id:
+                after = db.get(Bullet, after_id)
+                if after is None or after.is_deleted or after.user_id != user_id:
+                    raise HTTPException(status_code=404, detail="after not found")
+                if after.parent_id != parent_id:
+                    raise HTTPException(status_code=400, detail="after_id parent mismatch")
+
+                insert_index = int(after.order_index) + 1
+                _shift_siblings_right(db, user_id, parent_id, insert_index)
+                order_index = insert_index
+            else:
+                order_index = _max_order(db, user_id, parent_id) + 1
 
             node = Bullet(
                 id=gen_uuid(),
@@ -567,14 +606,25 @@ def update_node(node_id: str, payload: UpdateNodeIn, user_id: Optional[str] = No
 
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: str, user_id: Optional[str] = None):
+    """
+    ✅ 根治：幂等删除
+    - 节点不存在 / 已删除 / 不属于该 user：直接 ok（防止并发/重复触发导致 404 + 白屏）
+    - root 仍然禁止删除
+    """
     db = SessionLocal()
     try:
         user_id = norm_user_id(user_id)
 
         with db.begin():
             node = db.get(Bullet, node_id)
-            if node is None or node.is_deleted or node.user_id != user_id:
-                raise HTTPException(status_code=404, detail="node not found")
+
+            # ✅ 幂等：不存在也当成功
+            if node is None:
+                return {"ok": True}
+            if node.user_id != user_id:
+                return {"ok": True}
+            if node.is_deleted:
+                return {"ok": True}
 
             if node.is_root is True:
                 raise HTTPException(status_code=400, detail="cannot delete root")

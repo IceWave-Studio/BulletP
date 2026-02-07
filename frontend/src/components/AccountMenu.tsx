@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useStore } from "../store";
 
 export default function AccountMenu(props: {
-  onLogout?: () => void; // 可选：让父组件顺便 reset history / sidebar
+  onLogout?: () => void;
 }) {
   const email = useStore((s) => s.email);
   const clearAuth = useStore((s) => s.clearAuth);
@@ -15,7 +15,6 @@ export default function AccountMenu(props: {
   const gray = "#9CA3AF";
   const black = "#111827";
 
-  // 点击外部关闭 + ESC 关闭
   useEffect(() => {
     if (!open) return;
 
@@ -46,7 +45,6 @@ export default function AccountMenu(props: {
 
   return (
     <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
-      {/* 三点按钮 */}
       <button
         ref={btnRef}
         aria-label="Account menu"
@@ -63,17 +61,16 @@ export default function AccountMenu(props: {
           background: "transparent",
         }}
         onMouseEnter={(e) => {
+          if (open) return;
           (e.currentTarget as HTMLButtonElement).style.background = "rgba(0,0,0,0.06)";
         }}
         onMouseLeave={(e) => {
           (e.currentTarget as HTMLButtonElement).style.background = "transparent";
         }}
       >
-        {/* 竖着三个点：和你主页灰阶一致 */}
         <span style={{ fontSize: 22, lineHeight: "22px", color: grayLight }}>⋮</span>
       </button>
 
-      {/* dropdown */}
       {open && (
         <div
           ref={panelRef}
@@ -90,7 +87,6 @@ export default function AccountMenu(props: {
             zIndex: 9999,
           }}
         >
-          {/* Log out */}
           <button
             onClick={doLogout}
             style={{
@@ -118,7 +114,6 @@ export default function AccountMenu(props: {
             <span>Log out</span>
           </button>
 
-          {/* 分割线 */}
           <div
             style={{
               height: 1,
@@ -127,7 +122,6 @@ export default function AccountMenu(props: {
             }}
           />
 
-          {/* Email 显示（灰色小字） */}
           <div
             style={{
               padding: "4px 10px 8px 10px",

@@ -31,7 +31,6 @@ export default function LoginEmail() {
   const codeRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    // autofocus
     if (step === "email") emailRef.current?.focus();
     if (step === "code") codeRef.current?.focus();
   }, [step]);
@@ -55,9 +54,15 @@ export default function LoginEmail() {
     setLoading(true);
     try {
       const res = await api.emailStart({ email: email.trim().toLowerCase() });
-      // 后端返回 expires_in（秒），我们给一个 resend cooldown（比如 30 秒）
+
       setStep("code");
-      setCooldown(Math.min(60, Math.max(20, Math.floor(res.expires_in / 10)))); // 20~60s
+
+      // ✅ 根治：后端可能不返回 expires_in（当前就是这样）
+      // 用一个合理默认值：30 秒 resend 冷却（也可写死 60）
+      const expiresIn = typeof res.expires_in === "number" ? res.expires_in : 300;
+      const nextCooldown = Math.min(60, Math.max(20, Math.floor(expiresIn / 10))); // 20~60s
+
+      setCooldown(nextCooldown);
     } catch (e: any) {
       setErr(e?.message || "发送失败，请稍后重试。");
     } finally {
@@ -84,9 +89,7 @@ export default function LoginEmail() {
         code: code.trim(),
       });
 
-      // ✅ 登录态落 store + localStorage
       setAuth(res.user_id, res.home_id, email.trim().toLowerCase());
-      // 之后路由/页面切换由你的 App 外层决定（比如根据 userId 渲染 MainApp）
     } catch (e: any) {
       setErr(e?.message || "验证码错误或已过期。");
     } finally {
@@ -98,13 +101,13 @@ export default function LoginEmail() {
     if (e.key !== "Enter") return;
     if (loading) return;
 
-    if (step === "email") sendCode();
-    else verify();
+    if (step === "email") void sendCode();
+    else void verify();
   };
 
   return (
     <div className="h-screen w-screen bg-white text-gray-900 font-sans overflow-hidden">
-      {/* 顶部极简 Header（对齐主站风格） */}
+      {/* 顶部极简 Header */}
       <div
         style={{
           height: 56,
@@ -124,24 +127,21 @@ export default function LoginEmail() {
         >
           BulletP
         </div>
-        <div style={{ marginLeft: 12, color: gray, fontSize: 13 }}>
-          Email Login
-        </div>
+        <div style={{ marginLeft: 12, color: gray, fontSize: 13 }}>Email Login</div>
       </div>
 
       {/* 居中卡片 */}
       <div className="flex items-center justify-center" style={{ height: "calc(100vh - 56px)" }}>
         <div
-        style={{
+          style={{
             width: 440,
-            boxSizing: "border-box", // ✅ 防溢出
+            boxSizing: "border-box",
             border: "1px solid rgba(0,0,0,0.10)",
             borderRadius: 18,
             boxShadow: "0 10px 30px rgba(0,0,0,0.06)",
             padding: 22,
-        }}
+          }}
         >
-
           <div style={{ fontSize: 18, fontWeight: 800, color: black }}>
             {step === "email" ? "Sign in with Email" : "Enter verification code"}
           </div>
@@ -165,11 +165,11 @@ export default function LoginEmail() {
                 setErr(null);
               }}
               onKeyDown={onEnter}
-              disabled={loading || step === "code"} // code step 锁 email，保持一致性
+              disabled={loading || step === "code"}
               placeholder="you@example.com"
               style={{
                 width: "100%",
-                boxSizing: "border-box", 
+                boxSizing: "border-box",
                 height: 44,
                 borderRadius: 12,
                 border: "1px solid rgba(0,0,0,0.12)",
@@ -190,7 +190,6 @@ export default function LoginEmail() {
               ref={codeRef}
               value={code}
               onChange={(e) => {
-                // 只允许数字
                 const v = e.target.value.replace(/[^\d]/g, "").slice(0, 6);
                 setCode(v);
                 setErr(null);
@@ -202,7 +201,7 @@ export default function LoginEmail() {
               autoComplete="one-time-code"
               style={{
                 width: "100%",
-                boxSizing: "border-box", 
+                boxSizing: "border-box",
                 height: 44,
                 borderRadius: 12,
                 border: "1px solid rgba(0,0,0,0.12)",
@@ -236,7 +235,7 @@ export default function LoginEmail() {
           <div style={{ marginTop: 18, display: "flex", gap: 10 }}>
             {step === "email" ? (
               <button
-                onClick={sendCode}
+                onClick={() => void sendCode()}
                 disabled={loading || !emailOk || cooldown > 0}
                 style={{
                   flex: 1,
@@ -257,7 +256,6 @@ export default function LoginEmail() {
                     setStep("email");
                     setCode("");
                     setErr(null);
-                    // 允许修改邮箱
                     window.setTimeout(() => emailRef.current?.focus(), 0);
                   }}
                   disabled={loading}
@@ -283,7 +281,7 @@ export default function LoginEmail() {
                 </button>
 
                 <button
-                  onClick={verify}
+                  onClick={() => void verify()}
                   disabled={loading || !codeOk}
                   style={{
                     flex: 1,
@@ -315,7 +313,7 @@ export default function LoginEmail() {
             >
               <span>Didn’t receive it?</span>
               <button
-                onClick={sendCode}
+                onClick={() => void sendCode()}
                 disabled={loading || cooldown > 0}
                 style={{
                   color: cooldown > 0 ? grayLight : black,
@@ -328,10 +326,7 @@ export default function LoginEmail() {
             </div>
           )}
 
-          {/* tiny footer */}
-          <div style={{ marginTop: 18, fontSize: 12, color: grayLight }}>
-            Tip: press Enter to continue.
-          </div>
+          <div style={{ marginTop: 18, fontSize: 12, color: grayLight }}>Tip: press Enter to continue.</div>
         </div>
       </div>
     </div>

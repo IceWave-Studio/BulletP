@@ -362,13 +362,11 @@ export default function MainApp() {
               })}
             </div>
 
-            {/* ✅ Right side: Account menu (⋮ dropdown) */}
+            {/* ✅ Right side: Account menu */}
             <AccountMenu
               onLogout={() => {
-                // reset history（切账号不乱跳）
                 historyRef.current = [""];
                 historyIndexRef.current = 0;
-                // 可选：登出后 sidebar 回默认展开
                 setSidebarOpen(true);
               }}
             />
@@ -393,7 +391,10 @@ export default function MainApp() {
 
                   <div style={{ marginTop: children.length ? 18 : 0, paddingLeft: 0 }}>
                     <button
-                      onClick={() => rootId && appendChild(rootId)}
+                      onClick={() => {
+                        if (!rootId) return;
+                        void appendChild(rootId).catch(console.error);
+                      }}
                       title="Add"
                       style={{
                         display: "inline-flex",
@@ -460,7 +461,8 @@ function EditableTitle({ nodeId }: { nodeId: string }) {
     const html = cleanupZwsp(el.innerHTML);
     if (html !== lastCommittedRef.current) {
       lastCommittedRef.current = html;
-      updateContent(nodeId, html);
+      // ✅ 防止 Uncaught promise
+      void updateContent(nodeId, html).catch(console.error);
     }
   };
 
@@ -471,6 +473,13 @@ function EditableTitle({ nodeId }: { nodeId: string }) {
       if (composingRef.current) return;
       flushToStore();
     }, 120);
+  };
+
+  const clearPending = () => {
+    if (pendingTimerRef.current) {
+      window.clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = null;
+    }
   };
 
   return (
@@ -485,12 +494,10 @@ function EditableTitle({ nodeId }: { nodeId: string }) {
           style={{ textAlign: "left" }}
           onFocus={() => setFocusedId(nodeId)}
           onBlur={() => {
-            if (pendingTimerRef.current) {
-              window.clearTimeout(pendingTimerRef.current);
-              pendingTimerRef.current = null;
-            }
+            clearPending();
             flushToStore();
-            if (focusedId === nodeId) setFocusedId(null);
+            // ✅ 用 isFocused，避免 stale focusedId
+            if (isFocused) setFocusedId(null);
           }}
           onCompositionStart={() => {
             composingRef.current = true;

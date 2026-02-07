@@ -1,5 +1,4 @@
 // src/api.ts
-
 import { useStore } from "./store";
 
 /** =========================
@@ -22,7 +21,7 @@ export type ApiTreeNode = ApiNode & {
 /** ---------- Auth ---------- */
 export type EmailStartRes = {
   ok: boolean;
-  expires_in: number;
+  expires_in?: number; // 兼容：你后端目前返回 {"ok": true}，这里设为可选
 };
 
 export type EmailVerifyRes = {
@@ -145,7 +144,8 @@ export const api = {
     request<ApiTreeNode>(`/api/nodes/${rootId}/subtree?depth=${depth}`),
 
   /* ---------- CRUD ---------- */
-  createNode: (payload: { parent_id?: string | null; text: string }) =>
+  // ✅ 根治：支持 after_id（后端已实现）
+  createNode: (payload: { parent_id?: string | null; text: string; after_id?: string | null }) =>
     request<ApiNode>("/api/nodes", {
       method: "POST",
       body: JSON.stringify(payload),

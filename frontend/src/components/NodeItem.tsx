@@ -75,21 +75,40 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const lastCommittedRef = useRef<string>("");
   const composingRef = useRef(false);
 
-  if (!node) return null;
-
-  const hasChildren = (node.hasChildren ?? false) || (node.children?.length ?? 0) > 0;
+  // ✅ 不能 early return 在 hooks 前，所以这里用派生变量保护
   const isFocused = focusedId === id;
+  const hasChildren =
+    ((node?.hasChildren ?? false) || (node?.children?.length ?? 0) > 0) && !!node;
 
+  // ====== 关键修复：聚焦时如果 DOM 是空的，也要灌回 store 内容 ======
   useEffect(() => {
     const el = editorRef.current;
     if (!el) return;
 
-    const html = node.content || "";
+    const html = node?.content ?? "";
+
+    // 非聚焦：正常同步
     if (!isFocused) {
       if (el.innerHTML !== html) el.innerHTML = html;
       lastCommittedRef.current = html;
+      return;
     }
-  }, [node.content, isFocused]);
+
+    // 聚焦：通常不改 DOM，避免打断输入
+    // 但如果这是“重挂载/移动后”的新 DOM，innerHTML 可能是空的 → 必须写回
+    const domEmpty =
+      el.innerHTML === "" ||
+      el.innerHTML === "<br>" ||
+      cleanupZwsp(el.innerHTML).trim() === "";
+
+    if (domEmpty && cleanupZwsp(html).trim() !== "") {
+      el.innerHTML = html;
+      lastCommittedRef.current = html;
+
+      // 你可以选择把光标放末尾（Tab 缩进后体验更像 WorkFlowy）
+      requestAnimationFrame(() => moveCaretToEnd(el));
+    }
+  }, [node?.content, isFocused]);
 
   useEffect(() => {
     if (!isFocused) return;
@@ -108,6 +127,13 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     });
   }, [isFocused, caretToEndId, id, setCaretToEndId]);
 
+  const clearPending = () => {
+    if (pendingTimerRef.current) {
+      window.clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = null;
+    }
+  };
+
   const flushToStore = () => {
     const el = editorRef.current;
     if (!el) return;
@@ -115,7 +141,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     const html = cleanupZwsp(el.innerHTML);
     if (html !== lastCommittedRef.current) {
       lastCommittedRef.current = html;
-      updateContent(id, html);
+      void updateContent(id, html).catch(console.error);
     }
   };
 
@@ -127,6 +153,9 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
       flushToStore();
     }, 120);
   };
+
+  // ✅ 渲染时再判空
+  if (!node) return null;
 
   const bulletCollapsed = hasChildren && !!node.isCollapsed;
 
@@ -187,12 +216,9 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
             style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
             onFocus={() => setFocusedId(id)}
             onBlur={() => {
-              if (pendingTimerRef.current) {
-                window.clearTimeout(pendingTimerRef.current);
-                pendingTimerRef.current = null;
-              }
+              clearPending();
               flushToStore();
-              if (focusedId === id) setFocusedId(null);
+              if (isFocused) setFocusedId(null);
             }}
             onCompositionStart={() => (composingRef.current = true)}
             onCompositionEnd={() => {
@@ -213,14 +239,11 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
               if (e.key === "Enter") {
                 const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
                 if (ime) return;
-                e.preventDefault();
 
-                if (pendingTimerRef.current) {
-                  window.clearTimeout(pendingTimerRef.current);
-                  pendingTimerRef.current = null;
-                }
+                e.preventDefault();
+                clearPending();
                 flushToStore();
-                createAfter(id);
+                void createAfter(id).catch(console.error);
                 return;
               }
 
@@ -232,24 +255,18 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
                 const plain = (el?.innerText || "").replace(/\u200B/g, "").trim();
                 if (plain.length === 0) {
                   e.preventDefault();
-                  if (pendingTimerRef.current) {
-                    window.clearTimeout(pendingTimerRef.current);
-                    pendingTimerRef.current = null;
-                  }
+                  clearPending();
                   flushToStore();
-                  deleteIfEmpty(id);
+                  void deleteIfEmpty(id).catch(console.error);
                   return;
                 }
               }
 
               if (e.key === "Tab") {
                 e.preventDefault();
-                if (pendingTimerRef.current) {
-                  window.clearTimeout(pendingTimerRef.current);
-                  pendingTimerRef.current = null;
-                }
+                clearPending();
                 flushToStore();
-                e.shiftKey ? outdent(id) : indent(id);
+                void (e.shiftKey ? outdent(id) : indent(id)).catch(console.error);
                 return;
               }
 
