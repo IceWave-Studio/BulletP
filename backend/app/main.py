@@ -76,7 +76,7 @@ class EmailVerifyIn(BaseModel):
 class CreateNodeIn(BaseModel):
     parent_id: Optional[str] = None
     text: str = ""
-    # ✅ 根治：插入到某个同级节点之后（同 parent_id）
+    # ✅ 插入到某个同级节点之后（同 parent_id）
     after_id: Optional[str] = None
 
 
@@ -228,7 +228,7 @@ def build_subtree(db: Session, user_id: str, root_id: str, depth: int):
                 Bullet.parent_id == node.id,
                 Bullet.is_deleted == False,
             )
-            .order_by(Bullet.order_index.asc(), Bullet.created_at.asc())
+            .order_by(Bullet.order_index.asc(), Bullet.created_at.asc(), Bullet.id.asc())
         ).scalars().all()
 
         out["children"] = [build(k, d - 1) for k in kids]
@@ -253,8 +253,7 @@ def _max_order(db: Session, user_id: str, parent_id: Optional[str]) -> int:
 
 def _shift_siblings_right(db: Session, user_id: str, parent_id: str, start_from: int):
     """
-    ✅ 根治：为插入腾位置
-    把同一 parent 下 order_index >= start_from 的兄弟节点全部 +1
+    为插入腾位置：把同一 parent 下 order_index >= start_from 的兄弟节点全部 +1
     """
     db.execute(
         update(Bullet)
@@ -266,6 +265,27 @@ def _shift_siblings_right(db: Session, user_id: str, parent_id: str, start_from:
         )
         .values(order_index=Bullet.order_index + 1)
     )
+
+
+def _reindex_children(db: Session, user_id: str, parent_id: str):
+    """
+    ✅ 关键：把同一 parent 下未删除 children 重新编号为 0..n-1
+    彻底消除 order_index 空洞/漂移，避免“新增节点莫名其妙上升”
+    """
+    kids = db.execute(
+        select(Bullet)
+        .where(
+            Bullet.user_id == user_id,
+            Bullet.parent_id == parent_id,
+            Bullet.is_deleted == False,
+        )
+        .order_by(Bullet.order_index.asc(), Bullet.created_at.asc(), Bullet.id.asc())
+    ).scalars().all()
+
+    for i, b in enumerate(kids):
+        if b.order_index != i:
+            b.order_index = i
+    db.flush()
 
 
 # =============================
@@ -316,7 +336,7 @@ def root():
 
 
 # -----------------------------
-# Auth - Email OTP (ONLY ONE VERSION)
+# Auth - Email OTP
 # -----------------------------
 @app.post("/api/auth/email/start")
 def email_start(payload: EmailStartIn, background_tasks: BackgroundTasks, request: Request):
@@ -451,10 +471,10 @@ def get_home(user_id: Optional[str] = None):
 @app.post("/api/nodes")
 def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
     """
-    ✅ 根治：支持 after_id
     - parent_id 为空：默认插到 Home 下
     - after_id 不为空：插到 after 节点之后（必须同一 parent）
     - 否则：追加到末尾
+    - ✅ 最后强制 reindex parent children：彻底消除空洞/漂移
     """
     db = SessionLocal()
     try:
@@ -463,7 +483,6 @@ def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
         after_id = payload.after_id
 
         with db.begin():
-            # parent_id None => Home 下
             if parent_id is None:
                 home = ensure_home(db, user_id)
                 parent_id = home.id
@@ -472,7 +491,6 @@ def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
             if parent is None or parent.is_deleted or parent.user_id != user_id:
                 raise HTTPException(status_code=404, detail="parent not found")
 
-            # ✅ 核心：计算插入位置
             if after_id:
                 after = db.get(Bullet, after_id)
                 if after is None or after.is_deleted or after.user_id != user_id:
@@ -497,6 +515,9 @@ def create_node(payload: CreateNodeIn, user_id: Optional[str] = None):
             )
             db.add(node)
             db.flush()
+
+            # ✅ 关键：无论历史 order_index 有没有洞，都强制重排
+            _reindex_children(db, user_id, parent_id)
 
         return {
             "id": node.id,
@@ -526,7 +547,7 @@ def get_children(parent_id: str, user_id: Optional[str] = None):
                 Bullet.parent_id == parent_id,
                 Bullet.is_deleted == False,
             )
-            .order_by(Bullet.order_index.asc(), Bullet.created_at.asc())
+            .order_by(Bullet.order_index.asc(), Bullet.created_at.asc(), Bullet.id.asc())
         ).scalars().all()
 
         out = []
@@ -607,9 +628,7 @@ def update_node(node_id: str, payload: UpdateNodeIn, user_id: Optional[str] = No
 @app.delete("/api/nodes/{node_id}")
 def delete_node(node_id: str, user_id: Optional[str] = None):
     """
-    ✅ 根治：幂等删除
-    - 节点不存在 / 已删除 / 不属于该 user：直接 ok（防止并发/重复触发导致 404 + 白屏）
-    - root 仍然禁止删除
+    幂等删除 + ✅ 删除后 reindex parent children
     """
     db = SessionLocal()
     try:
@@ -618,19 +637,21 @@ def delete_node(node_id: str, user_id: Optional[str] = None):
         with db.begin():
             node = db.get(Bullet, node_id)
 
-            # ✅ 幂等：不存在也当成功
             if node is None:
                 return {"ok": True}
             if node.user_id != user_id:
                 return {"ok": True}
             if node.is_deleted:
                 return {"ok": True}
-
             if node.is_root is True:
                 raise HTTPException(status_code=400, detail="cannot delete root")
 
+            parent_id = node.parent_id
             node.is_deleted = True
             db.flush()
+
+            if parent_id:
+                _reindex_children(db, user_id, parent_id)
 
         return {"ok": True}
     finally:
@@ -717,6 +738,9 @@ def move_node(node_id: str, payload: MoveNodeIn, user_id: Optional[str] = None):
                 node.order_index = new_order
                 db.flush()
 
+                # ✅ move 同 parent 后也 reindex（防洞+稳定）
+                _reindex_children(db, user_id, old_parent_id)
+
                 return {
                     "id": node.id,
                     "parent_id": node.parent_id,
@@ -756,6 +780,11 @@ def move_node(node_id: str, payload: MoveNodeIn, user_id: Optional[str] = None):
             node.order_index = new_order
             db.flush()
 
+            # ✅ 两边都 reindex
+            if old_parent_id:
+                _reindex_children(db, user_id, old_parent_id)
+            _reindex_children(db, user_id, new_parent_id)
+
         return {
             "id": node.id,
             "parent_id": node.parent_id,
@@ -785,7 +814,6 @@ def indent_node(node_id: str, user_id: Optional[str] = None):
             old_parent_id = node.parent_id
             old_order = node.order_index
 
-            # ✅ FIX: nearest previous sibling (order_index < old_order)
             prev_sibling = db.execute(
                 select(Bullet)
                 .where(
@@ -803,7 +831,6 @@ def indent_node(node_id: str, user_id: Optional[str] = None):
 
             new_parent_id = prev_sibling.id
 
-            # close gap in old parent
             db.execute(
                 update(Bullet)
                 .where(
@@ -815,10 +842,13 @@ def indent_node(node_id: str, user_id: Optional[str] = None):
                 .values(order_index=Bullet.order_index - 1)
             )
 
-            # append to new parent
             node.parent_id = new_parent_id
             node.order_index = _max_order(db, user_id, new_parent_id) + 1
             db.flush()
+
+            # ✅ 两边重排
+            _reindex_children(db, user_id, old_parent_id)
+            _reindex_children(db, user_id, new_parent_id)
 
         return {
             "id": node.id,
@@ -850,7 +880,6 @@ def outdent_node(node_id: str, user_id: Optional[str] = None):
             if parent is None or parent.is_deleted or parent.user_id != user_id:
                 raise HTTPException(status_code=404, detail="parent not found")
 
-            # ✅ FIX: cannot outdent beyond Home
             if parent.is_root is True:
                 raise HTTPException(status_code=400, detail="cannot outdent beyond Home")
 
@@ -863,7 +892,6 @@ def outdent_node(node_id: str, user_id: Optional[str] = None):
 
             insert_order = parent.order_index + 1
 
-            # close gap in old parent
             db.execute(
                 update(Bullet)
                 .where(
@@ -875,7 +903,6 @@ def outdent_node(node_id: str, user_id: Optional[str] = None):
                 .values(order_index=Bullet.order_index - 1)
             )
 
-            # make space in grand parent
             db.execute(
                 update(Bullet)
                 .where(
@@ -890,6 +917,10 @@ def outdent_node(node_id: str, user_id: Optional[str] = None):
             node.parent_id = grand_parent_id
             node.order_index = insert_order
             db.flush()
+
+            # ✅ 两边重排
+            _reindex_children(db, user_id, old_parent_id)
+            _reindex_children(db, user_id, grand_parent_id)
 
         return {
             "id": node.id,
