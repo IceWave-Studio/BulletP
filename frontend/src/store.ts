@@ -16,7 +16,7 @@ export type UiNode = {
   hasChildren?: boolean;
   isCollapsed?: boolean;
 
-  // ✅ 如果这是 UI temp 节点，serverId 记录真实 id
+  // ✅ temp 节点落地后对应的真实 id
   serverId?: string;
 };
 
@@ -25,6 +25,11 @@ const AUTH_KEY = "bulletp_auth_v1";
 /* =========================
  * Store shape
  * ========================= */
+
+type PendingOp = {
+  indent?: { fromParentId: string; toParentId: string };
+  outdent?: { fromParentId: string; toParentId: string };
+};
 
 type Store = {
   // ---------- auth ----------
@@ -65,23 +70,26 @@ type Store = {
 
   toggleCollapse: (id: string) => void;
 
-  // ✅ pending text to prevent older fetches overriding local edit
+  // ✅ pending text (and rev) 防止旧回包覆盖最新输入
   pendingText: Record<string, string | undefined>;
   pendingTextRev: Record<string, number | undefined>;
 
-  // ✅ tempId -> realId（仅用于 API resolve，不用于 UI 替换 key）
+  // ✅ tempId -> realId（用于 API resolve）
   idRedirect: Record<string, string | undefined>;
-  // ✅ realId -> tempId（用于 loadChildren 去重/稳定 key）
+  // ✅ realId -> tempId（用于 loadChildren 去重，保持 key 稳定）
   realToTemp: Record<string, string | undefined>;
 
-  // ✅ create 管理：temp 创建中 + 是否被取消
+  // ✅ temp create 状态：用于 delete 取消、以及 create 回来后处理
   pendingCreate: Record<
     string,
     { parentId: string; canceled: boolean; createdRealId?: string | null } | undefined
   >;
 
-  // ✅ temp 节点结构操作队列（Enter 后秒 Tab）
-  pendingOps: Record<string, { indent?: boolean; outdent?: boolean } | undefined>;
+  // ✅ 对 temp 做的结构操作队列（Enter 后秒 Tab）
+  pendingOps: Record<string, PendingOp | undefined>;
+
+  // ✅ 被用户“本地删掉”的 realId 墓碑：loadChildren 忽略它，避免“又出现”
+  tombstoneReal: Record<string, number | undefined>; // value = timestamp
 
   updateContent: (id: string, html: string) => Promise<void>;
 
@@ -108,6 +116,32 @@ function normalizeHasChildren(n: any, existing?: UiNode) {
   return hint;
 }
 
+/**
+ * ✅ upsertFromApiToUiId：把 API real 节点写到指定 uiId（可能是 temp）
+ * pendingText 优先，避免校准覆盖用户正在输入的内容
+ */
+function upsertFromApiToUiId(state: Store, uiId: string, n: ApiNode): UiNode {
+  const existing = state.nodes[uiId];
+  const pending = state.pendingText[uiId];
+
+  const hasChildrenHint = normalizeHasChildren(n as any, existing);
+
+  const shouldDefaultCollapsed =
+    hasChildrenHint === true && (existing?.children?.length ?? 0) === 0;
+
+  return {
+    id: uiId,
+    parentId: n.parent_id,
+    content: pending !== undefined ? pending : n.text ?? existing?.content ?? "",
+    orderIndex: n.order_index ?? existing?.orderIndex ?? 0,
+    children: existing?.children ?? [],
+    hasChildren: hasChildrenHint,
+    isCollapsed:
+      existing?.isCollapsed !== undefined ? existing.isCollapsed : shouldDefaultCollapsed,
+    serverId: existing?.serverId,
+  };
+}
+
 function isHttp404(err: any) {
   const msg = String(err?.message || "");
   return msg.includes("HTTP 404");
@@ -115,6 +149,27 @@ function isHttp404(err: any) {
 
 function safeGetErrorMessage(err: any) {
   return String(err?.message || err || "");
+}
+
+/**
+ * PATCH text 回包只改 content，不碰 parent/order/children
+ */
+function mergeTextOnly(existing: UiNode | undefined, updated: ApiNode): UiNode {
+  if (!existing) {
+    return {
+      id: updated.id,
+      parentId: updated.parent_id,
+      content: updated.text ?? "",
+      orderIndex: updated.order_index ?? 0,
+      children: [],
+      hasChildren: (updated as any).has_children ?? false,
+      isCollapsed: false,
+    };
+  }
+  return {
+    ...existing,
+    content: updated.text ?? existing.content,
+  };
 }
 
 function newClientId(): string {
@@ -157,14 +212,11 @@ function recomputeOrderIndices(state: Store, parentId: string) {
 }
 
 /**
- * ✅ resolveId：把 UI id 映射到真实 server id（仅用于 API）
- * - 如果是 temp node 且有 serverId：用 serverId
- * - 如果有 idRedirect：继续 resolve
+ * ✅ resolveIdForApi：把 uiId 映射到真实 serverId（仅用于 API）
  */
 function resolveIdForApi(state: Store, uiId: string): string {
   let cur = uiId;
 
-  // 优先用 node.serverId
   const n = state.nodes[cur];
   if (n?.serverId) cur = n.serverId;
 
@@ -177,509 +229,591 @@ function resolveIdForApi(state: Store, uiId: string): string {
 }
 
 /**
- * ✅ upsert：支持把「API realId」写入到「UI tempId」上（保证 key 稳定）
+ * ✅ 合并 children：保留本地顺序（尤其是 temp），再把服务端返回的节点合并进来
  */
-function upsertFromApiToUiId(state: Store, uiId: string, apiNode: ApiNode): UiNode {
-  const existing = state.nodes[uiId];
-  const pending = state.pendingText[uiId];
+function mergeChildrenPreserveLocal(
+  state: Store,
+  uiParentId: string,
+  serverChildUiIds: string[]
+): string[] {
+  const p = state.nodes[uiParentId];
+  const local = (p?.children ?? []).filter((cid) => Boolean(state.nodes[cid]));
 
-  const hasChildrenHint = normalizeHasChildren(apiNode as any, existing);
+  const serverSet = new Set(serverChildUiIds);
 
-  const shouldDefaultCollapsed =
-    hasChildrenHint === true && (existing?.children?.length ?? 0) === 0;
+  const kept: string[] = [];
+  for (const cid of local) {
+    const isTemp = isTempId(cid);
+    const stillPendingTemp =
+      isTemp && Boolean(state.pendingCreate[cid]) && !state.pendingCreate[cid]?.canceled;
 
-  return {
-    id: uiId,
-    parentId: apiNode.parent_id,
-    content: pending !== undefined ? pending : apiNode.text ?? existing?.content ?? "",
-    orderIndex: apiNode.order_index ?? existing?.orderIndex ?? 0,
-    children: existing?.children ?? [],
-    hasChildren: hasChildrenHint,
-    isCollapsed:
-      existing?.isCollapsed !== undefined ? existing.isCollapsed : shouldDefaultCollapsed,
+    if (stillPendingTemp || serverSet.has(cid)) kept.push(cid);
+  }
 
-    // 如果 existing 是 temp，保留 serverId
-    serverId: existing?.serverId,
-  };
+  for (const sid of serverChildUiIds) {
+    if (!kept.includes(sid)) kept.push(sid);
+  }
+
+  return kept;
 }
 
 /**
- * PATCH text 回包只改 content，不碰 parent/order/children
+ * ✅ tombstone：短时间内忽略已经“本地删掉”的 realId，避免 loadChildren 拉回
  */
-function mergeTextOnly(existing: UiNode | undefined, updated: ApiNode): UiNode {
-  if (!existing) {
-    return {
-      id: updated.id,
-      parentId: updated.parent_id,
-      content: updated.text ?? "",
-      orderIndex: updated.order_index ?? 0,
-      children: [],
-      hasChildren: (updated as any).has_children ?? false,
-      isCollapsed: false,
-    };
-  }
-  return {
-    ...existing,
-    content: updated.text ?? existing.content,
-  };
+function isTombstoned(state: Store, realId: string) {
+  const t = state.tombstoneReal[realId];
+  if (!t) return false;
+  return Date.now() - t < 5 * 60 * 1000;
 }
 
 /* =========================
  * Store
  * ========================= */
 
-export const useStore = create<Store>((set, get) => ({
-  // ===== auth =====
-  userId: null,
-  email: null,
-  homeId: null,
-
-  sessionNonce: 0,
-
-  hydrateAuth: () => {
-    const raw = localStorage.getItem(AUTH_KEY);
-    if (!raw) return;
-
-    try {
-      const obj = JSON.parse(raw);
-      if (obj?.userId && obj?.homeId) {
-        set((s) => ({
-          userId: obj.userId,
-          email: obj.email ?? null,
-          homeId: obj.homeId,
-          rootId: obj.homeId,
-          sessionNonce: s.sessionNonce + 1,
-        }));
-      }
-    } catch {
-      /* ignore */
-    }
-  },
-
-  setAuth: (userId, homeId, email) => {
-    localStorage.setItem(AUTH_KEY, JSON.stringify({ userId, homeId, email }));
-
-    set((s) => ({
-      userId,
-      email: email ?? null,
-      homeId,
-      rootId: homeId,
-      focusedId: null,
-      sessionNonce: s.sessionNonce + 1,
-
-      nodes: {},
-      pendingText: {},
-      pendingTextRev: {},
-      idRedirect: {},
-      realToTemp: {},
-      pendingCreate: {},
-      pendingOps: {},
-      _inflightNodeFetch: {},
-      sidebarVersion: 0,
-      caretToEndId: null,
-    }));
-  },
-
-  clearAuth: () => {
-    localStorage.removeItem(AUTH_KEY);
-
-    set((s) => ({
-      userId: null,
-      email: null,
-      homeId: null,
-      nodes: {},
-      pendingText: {},
-      pendingTextRev: {},
-      idRedirect: {},
-      realToTemp: {},
-      pendingCreate: {},
-      pendingOps: {},
-      rootId: "",
-      focusedId: null,
-      caretToEndId: null,
-      _inflightNodeFetch: {},
-      sidebarVersion: 0,
-      sessionNonce: s.sessionNonce + 1,
-    }));
-  },
-
-  // ===== data =====
-  nodes: {},
-  pendingText: {},
-  pendingTextRev: {},
-  idRedirect: {},
-  realToTemp: {},
-  pendingCreate: {},
-  pendingOps: {},
-
-  rootId: "",
-  focusedId: null,
-
-  sidebarVersion: 0,
-  bumpSidebar: () => set((s) => ({ sidebarVersion: s.sidebarVersion + 1 })),
-
-  caretToEndId: null,
-  setCaretToEndId: (id) => set({ caretToEndId: id }),
-
-  _inflightNodeFetch: {},
-
-  init: async () => {
-    const { userId } = get();
-    if (!userId) return;
-
-    const nonce = get().sessionNonce;
-
-    let home: { id: string; text: string; parent_id: null; user_id: string };
-    try {
-      home = await api.getHome();
-    } catch (e) {
-      console.error("[init] getHome failed:", e);
-      return;
-    }
-    if (get().sessionNonce !== nonce) return;
-
-    set((s) => {
-      const next = { ...s.nodes };
-      next[home.id] = {
-        id: home.id,
-        parentId: null,
-        content: home.text ?? "Home",
-        orderIndex: 0,
-        children: [],
-        hasChildren: true,
-        isCollapsed: false,
-      };
-      return { nodes: next, homeId: home.id, rootId: home.id };
-    });
-
-    await get().loadChildren(home.id);
-  },
-
-  hydrateNode: (n) =>
-    set((s) => {
-      // 如果这是 server realId，但我们已有 temp 映射，则写回 temp
-      const uiId = s.realToTemp[n.id] ?? n.id;
-      return { nodes: { ...s.nodes, [uiId]: upsertFromApiToUiId(s as any, uiId, n) } };
-    }),
-
-  ensureNodeLoaded: async (id) => {
-    if (!id) return;
-
-    const nonce = get().sessionNonce;
+export const useStore = create<Store>((set, get) => {
+  // ✅ 只打服务端，不重复 UI 移动（关键修复）
+  const serverIndentOnly = async (
+    uiId: string,
+    fromParentId: string,
+    toParentId: string,
+    nonce: number
+  ) => {
     const st = get();
+    const apiId = resolveIdForApi(st, uiId);
+    if (isTempId(apiId)) return;
 
-    const apiId = resolveIdForApi(st, id);
-    const uiId = st.realToTemp[apiId] ?? id;
-
-    if (st.nodes[uiId]?.content !== undefined) return;
-
-    if (st._inflightNodeFetch[apiId]) {
-      await st._inflightNodeFetch[apiId];
-      return;
+    try {
+      await api.indentNode(apiId);
+      if (get().sessionNonce !== nonce) return;
+      void get().loadChildren(toParentId).catch(console.error);
+      void get().loadChildren(fromParentId).catch(console.error);
+    } catch (e) {
+      if (!isHttp404(e)) console.error("[indent/serverOnly] failed:", safeGetErrorMessage(e));
+      void get().loadChildren(fromParentId).catch(console.error);
+      void get().loadChildren(toParentId).catch(console.error);
     }
+  };
 
-    const p = (async () => {
+  const serverOutdentOnly = async (
+    uiId: string,
+    fromParentId: string,
+    toParentId: string,
+    nonce: number
+  ) => {
+    const st = get();
+    const apiId = resolveIdForApi(st, uiId);
+    if (isTempId(apiId)) return;
+
+    try {
+      await api.outdentNode(apiId);
+      if (get().sessionNonce !== nonce) return;
+      void get().loadChildren(fromParentId).catch(console.error);
+      void get().loadChildren(toParentId).catch(console.error);
+    } catch (e) {
+      if (!isHttp404(e)) console.error("[outdent/serverOnly] failed:", safeGetErrorMessage(e));
+      void get().loadChildren(fromParentId).catch(console.error);
+      void get().loadChildren(toParentId).catch(console.error);
+    }
+  };
+
+  return {
+    // ===== auth =====
+    userId: null,
+    email: null,
+    homeId: null,
+
+    sessionNonce: 0,
+
+    hydrateAuth: () => {
+      const raw = localStorage.getItem(AUTH_KEY);
+      if (!raw) return;
+
       try {
-        const n = await api.getNode(apiId);
-        if (get().sessionNonce !== nonce) return;
-        get().hydrateNode(n);
+        const obj = JSON.parse(raw);
+        if (obj?.userId && obj?.homeId) {
+          set((s) => ({
+            userId: obj.userId,
+            email: obj.email ?? null,
+            homeId: obj.homeId,
+            rootId: obj.homeId,
+            sessionNonce: s.sessionNonce + 1,
+          }));
+        }
+      } catch {
+        /* ignore */
+      }
+    },
+
+    setAuth: (userId, homeId, email) => {
+      localStorage.setItem(AUTH_KEY, JSON.stringify({ userId, homeId, email }));
+
+      set((s) => ({
+        userId,
+        email: email ?? null,
+        homeId,
+        rootId: homeId,
+        focusedId: null,
+        sessionNonce: s.sessionNonce + 1,
+
+        nodes: {},
+        pendingText: {},
+        pendingTextRev: {},
+        idRedirect: {},
+        realToTemp: {},
+        pendingCreate: {},
+        pendingOps: {},
+        tombstoneReal: {},
+        _inflightNodeFetch: {},
+        sidebarVersion: 0,
+        caretToEndId: null,
+      }));
+    },
+
+    clearAuth: () => {
+      localStorage.removeItem(AUTH_KEY);
+
+      set((s) => ({
+        userId: null,
+        email: null,
+        homeId: null,
+        nodes: {},
+        pendingText: {},
+        pendingTextRev: {},
+        idRedirect: {},
+        realToTemp: {},
+        pendingCreate: {},
+        pendingOps: {},
+        tombstoneReal: {},
+        rootId: "",
+        focusedId: null,
+        caretToEndId: null,
+        _inflightNodeFetch: {},
+        sidebarVersion: 0,
+        sessionNonce: s.sessionNonce + 1,
+      }));
+    },
+
+    // ===== data =====
+    nodes: {},
+    pendingText: {},
+    pendingTextRev: {},
+    idRedirect: {},
+    realToTemp: {},
+    pendingCreate: {},
+    pendingOps: {},
+    tombstoneReal: {},
+
+    rootId: "",
+    focusedId: null,
+
+    sidebarVersion: 0,
+    bumpSidebar: () => set((s) => ({ sidebarVersion: s.sidebarVersion + 1 })),
+
+    caretToEndId: null,
+    setCaretToEndId: (id) => set({ caretToEndId: id }),
+
+    _inflightNodeFetch: {},
+
+    init: async () => {
+      const { userId } = get();
+      if (!userId) return;
+
+      const nonce = get().sessionNonce;
+
+      let home: { id: string; text: string; parent_id: null; user_id: string };
+      try {
+        home = await api.getHome();
+      } catch (e) {
+        console.error("[init] getHome failed:", e);
+        return;
+      }
+      if (get().sessionNonce !== nonce) return;
+
+      set((s) => {
+        const next = { ...s.nodes };
+        next[home.id] = {
+          id: home.id,
+          parentId: null,
+          content: home.text ?? "Home",
+          orderIndex: 0,
+          children: [],
+          hasChildren: true,
+          isCollapsed: false,
+        };
+        return { nodes: next, homeId: home.id, rootId: home.id };
+      });
+
+      await get().loadChildren(home.id);
+    },
+
+    hydrateNode: (n) =>
+      set((s) => {
+        const uiId = s.realToTemp[n.id] ?? n.id;
+        return { nodes: { ...s.nodes, [uiId]: upsertFromApiToUiId(s as any, uiId, n) } };
+      }),
+
+    ensureNodeLoaded: async (id) => {
+      if (!id) return;
+
+      const nonce = get().sessionNonce;
+      const st0 = get();
+
+      const apiId = resolveIdForApi(st0, id);
+      if (isTempId(apiId)) return; // ✅ 不请求 temp
+
+      const uiId = st0.realToTemp[apiId] ?? id;
+
+      if (st0.nodes[uiId]?.content !== undefined) return;
+
+      if (st0._inflightNodeFetch[apiId]) {
+        await st0._inflightNodeFetch[apiId];
+        return;
+      }
+
+      const p = (async () => {
+        try {
+          const n = await api.getNode(apiId);
+          if (get().sessionNonce !== nonce) return;
+          get().hydrateNode(n);
+        } catch (e) {
+          if (isHttp404(e)) {
+            set((s2) => {
+              const next = { ...s2.nodes };
+              delete next[uiId];
+              return { nodes: next };
+            });
+            return;
+          }
+          console.error(e);
+        } finally {
+          set((s2) => {
+            const next = { ...s2._inflightNodeFetch };
+            delete next[apiId];
+            return { _inflightNodeFetch: next };
+          });
+        }
+      })();
+
+      set((s2) => ({
+        _inflightNodeFetch: { ...s2._inflightNodeFetch, [apiId]: p },
+      }));
+
+      await p;
+    },
+
+    loadChildren: async (parentId) => {
+      if (!parentId) return;
+
+      const nonce = get().sessionNonce;
+      const st0 = get();
+
+      const apiParentId = resolveIdForApi(st0, parentId);
+      if (isTempId(apiParentId)) return; // ✅ 不请求 temp parent
+
+      const uiParentId = st0.realToTemp[apiParentId] ?? parentId;
+
+      let rows: ApiNode[];
+      try {
+        rows = await api.getChildren(apiParentId);
       } catch (e) {
         if (isHttp404(e)) {
-          set((s2) => {
-            const next = { ...s2.nodes };
-            delete next[uiId];
+          const st = get();
+          if (st.rootId === uiParentId && st.homeId) {
+            set({ rootId: st.homeId });
+          }
+
+          set((s) => {
+            const next = { ...s.nodes };
+            delete next[uiParentId];
             return { nodes: next };
           });
+
+          get().bumpSidebar();
           return;
         }
-        console.error(e);
-      } finally {
-        set((s2) => {
-          const next = { ...s2._inflightNodeFetch };
-          delete next[apiId];
-          return { _inflightNodeFetch: next };
-        });
-      }
-    })();
 
-    set((s2) => ({
-      _inflightNodeFetch: { ...s2._inflightNodeFetch, [apiId]: p },
-    }));
-
-    await p;
-  },
-
-  loadChildren: async (parentId) => {
-    if (!parentId) return;
-
-    const nonce = get().sessionNonce;
-    const st0 = get();
-
-    const apiParentId = resolveIdForApi(st0, parentId);
-    const uiParentId = st0.realToTemp[apiParentId] ?? parentId;
-
-    let rows: ApiNode[];
-    try {
-      rows = await api.getChildren(apiParentId);
-    } catch (e) {
-      if (isHttp404(e)) {
-        const st = get();
-        if (st.rootId === uiParentId && st.homeId) {
-          set({ rootId: st.homeId });
-        }
-
-        set((s) => {
-          const next = { ...s.nodes };
-          delete next[uiParentId];
-          return { nodes: next };
-        });
-
+        console.error("[loadChildren] failed:", safeGetErrorMessage(e));
         get().bumpSidebar();
         return;
       }
 
-      console.error("[loadChildren] failed:", safeGetErrorMessage(e));
-      get().bumpSidebar();
-      return;
-    }
-
-    if (get().sessionNonce !== nonce) return;
-
-    set((s) => {
-      const next = { ...s.nodes };
-      const childIds: string[] = [];
-
-      for (const r of rows) {
-        // ✅ server 返回 realId，如果已有 temp 映射，用 tempId 作为 UI id
-        const uiChildId = s.realToTemp[r.id] ?? r.id;
-
-        // ✅ 把 API 节点写入对应 UI id（避免出现 real+temp 两份导致闪烁）
-        next[uiChildId] = upsertFromApiToUiId(s as any, uiChildId, r);
-
-        // 如果这个 UI 节点是 temp，但还没写 serverId，这里补一下
-        if (uiChildId !== r.id) {
-          next[uiChildId] = { ...next[uiChildId], serverId: r.id };
-        }
-
-        childIds.push(uiChildId);
-      }
-
-      const existingParent = next[uiParentId];
-      next[uiParentId] = {
-        id: uiParentId,
-        parentId: existingParent?.parentId ?? null,
-        content: existingParent?.content ?? "",
-        orderIndex: existingParent?.orderIndex ?? 0,
-        children: childIds,
-        hasChildren: childIds.length > 0,
-        isCollapsed: existingParent?.isCollapsed ?? false,
-        serverId: existingParent?.serverId,
-      };
-
-      return { nodes: next };
-    });
-
-    get().bumpSidebar();
-  },
-
-  setRootId: (id) => {
-    if (!id) return;
-    set({ rootId: id });
-    void get().ensureNodeLoaded(id).catch(console.error);
-  },
-
-  setFocusedId: (id) => set({ focusedId: id }),
-
-  getPathToRoot: (id) => {
-    const { nodes, homeId } = get();
-    const path: string[] = [];
-    let cur: string | null = id;
-
-    while (cur) {
-      path.push(cur);
-      cur = nodes[cur]?.parentId ?? null;
-    }
-
-    path.reverse();
-    return homeId && path[0] !== homeId ? [homeId, ...path] : path;
-  },
-
-  toggleCollapse: (id) => {
-    set((s) => {
-      const n = s.nodes[id];
-      if (!n) return s;
-      return { nodes: { ...s.nodes, [id]: { ...n, isCollapsed: !n.isCollapsed } } };
-    });
-
-    const n = get().nodes[id];
-    if (n && !n.isCollapsed && n.children.length === 0) {
-      void get().loadChildren(id).catch(console.error);
-    }
-
-    get().bumpSidebar();
-  },
-
-  updateContent: async (id, html) => {
-    if (!id) return;
-
-    const nonce = get().sessionNonce;
-    let myRev = 0;
-
-    set((s) => {
-      const n = s.nodes[id];
-      if (!n) return s;
-
-      const prev = s.pendingTextRev[id] ?? 0;
-      myRev = prev + 1;
-
-      return {
-        nodes: { ...s.nodes, [id]: { ...n, content: html } },
-        pendingText: { ...s.pendingText, [id]: html },
-        pendingTextRev: { ...s.pendingTextRev, [id]: myRev },
-      };
-    });
-
-    get().bumpSidebar();
-
-    const apiId = resolveIdForApi(get(), id);
-
-    try {
-      const updated = await api.patchNode(apiId, { text: html });
       if (get().sessionNonce !== nonce) return;
 
       set((s) => {
-        // ✅ 只认最新 rev，旧回包不允许覆盖（防止“最后几个字母消失又回来”）
-        if ((s.pendingTextRev[id] ?? 0) !== myRev) return s;
+        const next = { ...s.nodes };
+        const serverChildUiIds: string[] = [];
 
-        const nextPending = { ...s.pendingText };
-        const nextRev = { ...s.pendingTextRev };
-        delete nextPending[id];
-        delete nextRev[id];
+        for (const r of rows) {
+          if (isTombstoned(s, r.id)) continue;
 
-        const existing = s.nodes[id];
-        return {
-          pendingText: nextPending,
-          pendingTextRev: nextRev,
-          nodes: { ...s.nodes, [id]: mergeTextOnly(existing, updated) },
-        };
-      });
-    } catch (e) {
-      if (isHttp404(e)) return;
-      console.error("[updateContent] failed:", safeGetErrorMessage(e));
-    }
-  },
+          const uiChildId = s.realToTemp[r.id] ?? r.id;
 
-  appendChild: async (parentId) => {
-    const nonce = get().sessionNonce;
-    const apiParentId = resolveIdForApi(get(), parentId);
+          next[uiChildId] = upsertFromApiToUiId(s as any, uiChildId, r);
 
-    try {
-      await api.createNode({ parent_id: apiParentId, text: "" });
-    } catch (e) {
-      console.error("[appendChild] create failed:", safeGetErrorMessage(e));
-      return;
-    }
-
-    if (get().sessionNonce !== nonce) return;
-    await get().loadChildren(parentId);
-  },
-
-  /**
-   * ✅✅ 根治 Enter + 光标丢失：
-   * - UI 永远用 tempId 渲染，不做 temp->real key 替换
-   * - 只记录映射：tempId.serverId / idRedirect / realToTemp
-   * - loadChildren 会自动把 real 映射回 temp，避免闪烁和重复
-   */
-  createAfter: async (id) => {
-    const st0 = get();
-    const nonce = st0.sessionNonce;
-
-    const cur = st0.nodes[id];
-    if (!cur) return;
-
-    const parentId = cur.parentId ?? st0.homeId;
-    if (!parentId) return;
-
-    const parent = st0.nodes[parentId];
-    if (!parent) return;
-
-    const tempId = newClientId();
-
-    // 1) UI 立即插入 temp
-    set((s) => {
-      const p = s.nodes[parentId];
-      if (!p) return s;
-
-      const nextNodes: Record<string, UiNode> = { ...s.nodes };
-      nextNodes[tempId] = {
-        id: tempId,
-        parentId,
-        content: "",
-        orderIndex: 0,
-        children: [],
-        hasChildren: false,
-        isCollapsed: false,
-      };
-
-      nextNodes[parentId] = {
-        ...p,
-        children: insertAfter(p.children, id, tempId),
-        hasChildren: true,
-        isCollapsed: false,
-      };
-
-      const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
-
-      return {
-        nodes: reordered ?? nextNodes,
-        pendingCreate: {
-          ...s.pendingCreate,
-          [tempId]: { parentId, canceled: false, createdRealId: null },
-        },
-        focusedId: tempId,
-        caretToEndId: tempId,
-      };
-    });
-
-    get().bumpSidebar();
-
-    // 2) 后台 create（不阻塞 UI）
-    void (async () => {
-      try {
-        let created: ApiNode;
-
-        try {
-          created = await api.createNode({
-            parent_id: resolveIdForApi(get(), parentId),
-            text: "",
-            after_id: resolveIdForApi(get(), id),
-          });
-        } catch (e: any) {
-          const msg = safeGetErrorMessage(e);
-          if (msg.includes("after not found")) {
-            created = await api.createNode({
-              parent_id: resolveIdForApi(get(), parentId),
-              text: "",
-            });
-          } else {
-            throw e;
+          if (uiChildId !== r.id) {
+            next[uiChildId] = { ...next[uiChildId], serverId: r.id };
           }
+
+          serverChildUiIds.push(uiChildId);
         }
 
+        const existingParent = next[uiParentId];
+
+        const mergedChildren = mergeChildrenPreserveLocal(
+          { ...(s as any), nodes: next } as any,
+          uiParentId,
+          serverChildUiIds
+        );
+
+        next[uiParentId] = {
+          id: uiParentId,
+          parentId: existingParent?.parentId ?? null,
+          content: existingParent?.content ?? "",
+          orderIndex: existingParent?.orderIndex ?? 0,
+          children: mergedChildren,
+          hasChildren: mergedChildren.length > 0,
+          isCollapsed: existingParent?.isCollapsed ?? false,
+          serverId: existingParent?.serverId,
+        };
+
+        const reordered = recomputeOrderIndices({ ...(s as any), nodes: next } as any, uiParentId);
+        return { nodes: reordered ?? next };
+      });
+
+      get().bumpSidebar();
+    },
+
+    setRootId: (id) => {
+      if (!id) return;
+      set({ rootId: id });
+      void get().ensureNodeLoaded(id).catch(console.error);
+    },
+
+    setFocusedId: (id) => set({ focusedId: id }),
+
+    getPathToRoot: (id) => {
+      const { nodes, homeId } = get();
+      const path: string[] = [];
+      let cur: string | null = id;
+
+      while (cur) {
+        path.push(cur);
+        cur = nodes[cur]?.parentId ?? null;
+      }
+
+      path.reverse();
+      return homeId && path[0] !== homeId ? [homeId, ...path] : path;
+    },
+
+    toggleCollapse: (id) => {
+      set((s) => {
+        const n = s.nodes[id];
+        if (!n) return s;
+        return { nodes: { ...s.nodes, [id]: { ...n, isCollapsed: !n.isCollapsed } } };
+      });
+
+      const n = get().nodes[id];
+      if (n && !n.isCollapsed && n.children.length === 0) {
+        void get().loadChildren(id).catch(console.error);
+      }
+
+      get().bumpSidebar();
+    },
+
+    updateContent: async (id, html) => {
+      if (!id) return;
+
+      const nonce = get().sessionNonce;
+      let myRev = 0;
+
+      set((s) => {
+        const n = s.nodes[id];
+        if (!n) return s;
+
+        const prev = s.pendingTextRev[id] ?? 0;
+        myRev = prev + 1;
+
+        return {
+          nodes: { ...s.nodes, [id]: { ...n, content: html } },
+          pendingText: { ...s.pendingText, [id]: html },
+          pendingTextRev: { ...s.pendingTextRev, [id]: myRev },
+        };
+      });
+
+      get().bumpSidebar();
+
+      const st1 = get();
+      const node = st1.nodes[id];
+
+      if (isTempId(id) && !node?.serverId) return;
+
+      const apiId = resolveIdForApi(st1, id);
+      if (isTempId(apiId)) return;
+
+      try {
+        const updated = await api.patchNode(apiId, { text: html });
         if (get().sessionNonce !== nonce) return;
 
-        const st1 = get();
-        const pc = st1.pendingCreate[tempId];
-        const tempStillExists = Boolean(st1.nodes[tempId]);
-        const canceled = pc?.canceled === true;
+        set((s) => {
+          if ((s.pendingTextRev[id] ?? 0) !== myRev) return s;
 
-        // 如果 temp 被秒删：创建成功也要立即删 real（防止“过一会节点又出现”）
-        if (canceled || !tempStillExists) {
-          try {
-            await api.deleteNode(created.id);
-          } catch {
-            /* ignore */
+          const nextPending = { ...s.pendingText };
+          const nextRev = { ...s.pendingTextRev };
+          delete nextPending[id];
+          delete nextRev[id];
+
+          const existing = s.nodes[id];
+          return {
+            pendingText: nextPending,
+            pendingTextRev: nextRev,
+            nodes: { ...s.nodes, [id]: mergeTextOnly(existing, updated) },
+          };
+        });
+      } catch (e) {
+        if (isHttp404(e)) return;
+        console.error("[updateContent] failed:", safeGetErrorMessage(e));
+      }
+    },
+
+    appendChild: async (parentId) => {
+      const st0 = get();
+      const nonce = st0.sessionNonce;
+
+      const p = st0.nodes[parentId];
+      if (!p) return;
+
+      const tempId = newClientId();
+
+      set((s) => {
+        const parent = s.nodes[parentId];
+        if (!parent) return s;
+
+        const nextNodes: Record<string, UiNode> = { ...s.nodes };
+        nextNodes[tempId] = {
+          id: tempId,
+          parentId,
+          content: "",
+          orderIndex: parent.children.length,
+          children: [],
+          hasChildren: false,
+          isCollapsed: false,
+        };
+
+        nextNodes[parentId] = {
+          ...parent,
+          children: [...parent.children, tempId],
+          hasChildren: true,
+          isCollapsed: false,
+        };
+
+        const reordered = recomputeOrderIndices({ ...(s as any), nodes: nextNodes } as any, parentId);
+
+        return {
+          nodes: reordered ?? nextNodes,
+          pendingCreate: {
+            ...s.pendingCreate,
+            [tempId]: { parentId, canceled: false, createdRealId: null },
+          },
+          focusedId: tempId,
+          caretToEndId: tempId,
+        };
+      });
+
+      get().bumpSidebar();
+
+      void (async () => {
+        try {
+          const apiParent = resolveIdForApi(get(), parentId);
+          if (isTempId(apiParent)) return;
+
+          const created = await api.createNode({ parent_id: apiParent, text: "" });
+
+          if (get().sessionNonce !== nonce) return;
+
+          const st1 = get();
+          const pc = st1.pendingCreate[tempId];
+          const tempStillExists = Boolean(st1.nodes[tempId]);
+          const canceled = pc?.canceled === true;
+
+          if (canceled || !tempStillExists) {
+            set((s) => ({
+              tombstoneReal: { ...s.tombstoneReal, [created.id]: Date.now() },
+            }));
+            try {
+              await api.deleteNode(created.id);
+            } catch {
+              /* ignore */
+            }
+            void get().loadChildren(parentId).catch(console.error);
+
+            set((s) => {
+              const next = { ...s.pendingCreate };
+              delete next[tempId];
+              return { pendingCreate: next };
+            });
+
+            return;
           }
+
+          set((s) => {
+            const tmp = s.nodes[tempId];
+            if (!tmp) return s;
+
+            return {
+              nodes: { ...s.nodes, [tempId]: { ...tmp, serverId: created.id } },
+              idRedirect: { ...s.idRedirect, [tempId]: created.id },
+              realToTemp: { ...s.realToTemp, [created.id]: tempId },
+              pendingCreate: {
+                ...s.pendingCreate,
+                [tempId]: { parentId, canceled: false, createdRealId: created.id },
+              },
+            };
+          });
+
+          get().bumpSidebar();
+
+          // 补发最后一次输入
+          const st2 = get();
+          const latestHtml = st2.pendingText[tempId] ?? st2.nodes[tempId]?.content ?? "";
+          if (latestHtml !== undefined) {
+            try {
+              await api.patchNode(created.id, { text: latestHtml });
+              set((s) => {
+                const nextPending = { ...s.pendingText };
+                const nextRev = { ...s.pendingTextRev };
+                delete nextPending[tempId];
+                delete nextRev[tempId];
+                return { pendingText: nextPending, pendingTextRev: nextRev };
+              });
+            } catch {
+              /* ignore */
+            }
+          }
+
+          // ✅ flush pendingOps：只打服务端，不重复 UI 移动（关键修复）
+          const op = st2.pendingOps[tempId];
+          if (op?.indent) {
+            set((s) => {
+              const next = { ...s.pendingOps };
+              delete next[tempId];
+              return { pendingOps: next };
+            });
+            void serverIndentOnly(tempId, op.indent.fromParentId, op.indent.toParentId, nonce);
+          } else if (op?.outdent) {
+            set((s) => {
+              const next = { ...s.pendingOps };
+              delete next[tempId];
+              return { pendingOps: next };
+            });
+            void serverOutdentOnly(tempId, op.outdent.fromParentId, op.outdent.toParentId, nonce);
+          } else {
+            set((s) => {
+              const next = { ...s.pendingOps };
+              delete next[tempId];
+              return { pendingOps: next };
+            });
+          }
+
           void get().loadChildren(parentId).catch(console.error);
 
           set((s) => {
@@ -687,327 +821,417 @@ export const useStore = create<Store>((set, get) => ({
             delete next[tempId];
             return { pendingCreate: next };
           });
-
-          return;
+        } catch (e) {
+          console.error("[appendChild] create failed:", safeGetErrorMessage(e));
+          void get().loadChildren(parentId).catch(console.error);
         }
+      })();
+    },
 
-        // ✅ 关键：不替换 tempId！只记录映射 & 把 serverId 写到 temp 节点上
-        set((s) => {
-          const tmp = s.nodes[tempId];
-          if (!tmp) return s;
+    createAfter: async (id) => {
+      const st0 = get();
+      const nonce = st0.sessionNonce;
 
-          return {
-            nodes: {
-              ...s.nodes,
-              [tempId]: { ...tmp, serverId: created.id },
-            },
-            idRedirect: {
-              ...s.idRedirect,
-              [tempId]: created.id,
-            },
-            realToTemp: {
-              ...s.realToTemp,
-              [created.id]: tempId,
-            },
-            pendingCreate: {
-              ...s.pendingCreate,
-              [tempId]: { parentId, canceled: false, createdRealId: created.id },
-            },
-          };
-        });
+      const cur = st0.nodes[id];
+      if (!cur) return;
 
-        get().bumpSidebar();
+      const parentId = cur.parentId ?? st0.homeId;
+      if (!parentId) return;
 
-        // 如果用户在 temp 上秒按 Tab，我们这里自动执行队列（但 UI 不会再闪）
-        const st2 = get();
-        const op = st2.pendingOps[tempId];
-        if (op) {
+      const parent = st0.nodes[parentId];
+      if (!parent) return;
+
+      const tempId = newClientId();
+
+      set((s) => {
+        const p = s.nodes[parentId];
+        if (!p) return s;
+
+        const nextNodes: Record<string, UiNode> = { ...s.nodes };
+        nextNodes[tempId] = {
+          id: tempId,
+          parentId,
+          content: "",
+          orderIndex: 0,
+          children: [],
+          hasChildren: false,
+          isCollapsed: false,
+        };
+
+        nextNodes[parentId] = {
+          ...p,
+          children: insertAfter(p.children, id, tempId),
+          hasChildren: true,
+          isCollapsed: false,
+        };
+
+        const reordered = recomputeOrderIndices({ ...(s as any), nodes: nextNodes } as any, parentId);
+
+        return {
+          nodes: reordered ?? nextNodes,
+          pendingCreate: {
+            ...s.pendingCreate,
+            [tempId]: { parentId, canceled: false, createdRealId: null },
+          },
+          focusedId: tempId,
+          caretToEndId: tempId,
+        };
+      });
+
+      get().bumpSidebar();
+
+      void (async () => {
+        try {
+          let created: ApiNode;
+
+          const apiParent = resolveIdForApi(get(), parentId);
+          if (isTempId(apiParent)) return;
+
+          try {
+            const apiAfter = resolveIdForApi(get(), id);
+            created = await api.createNode({
+              parent_id: apiParent,
+              text: "",
+              after_id: isTempId(apiAfter) ? undefined : apiAfter,
+            });
+          } catch (e: any) {
+            const msg = safeGetErrorMessage(e);
+            if (msg.includes("after not found")) {
+              created = await api.createNode({ parent_id: apiParent, text: "" });
+            } else {
+              throw e;
+            }
+          }
+
+          if (get().sessionNonce !== nonce) return;
+
+          const st1 = get();
+          const pc = st1.pendingCreate[tempId];
+          const tempStillExists = Boolean(st1.nodes[tempId]);
+          const canceled = pc?.canceled === true;
+
+          if (canceled || !tempStillExists) {
+            set((s) => ({
+              tombstoneReal: { ...s.tombstoneReal, [created.id]: Date.now() },
+            }));
+            try {
+              await api.deleteNode(created.id);
+            } catch {
+              /* ignore */
+            }
+            void get().loadChildren(parentId).catch(console.error);
+
+            set((s) => {
+              const next = { ...s.pendingCreate };
+              delete next[tempId];
+              return { pendingCreate: next };
+            });
+
+            return;
+          }
+
           set((s) => {
-            const next = { ...s.pendingOps };
-            delete next[tempId];
-            return { pendingOps: next };
+            const tmp = s.nodes[tempId];
+            if (!tmp) return s;
+
+            return {
+              nodes: { ...s.nodes, [tempId]: { ...tmp, serverId: created.id } },
+              idRedirect: { ...s.idRedirect, [tempId]: created.id },
+              realToTemp: { ...s.realToTemp, [created.id]: tempId },
+              pendingCreate: {
+                ...s.pendingCreate,
+                [tempId]: { parentId, canceled: false, createdRealId: created.id },
+              },
+            };
           });
 
-          if (op.indent) void get().indent(tempId).catch(console.error);
-          if (op.outdent) void get().outdent(tempId).catch(console.error);
+          get().bumpSidebar();
+
+          // 补发最后一次输入
+          const st2 = get();
+          const latestHtml = st2.pendingText[tempId] ?? st2.nodes[tempId]?.content ?? "";
+          if (latestHtml !== undefined) {
+            try {
+              await api.patchNode(created.id, { text: latestHtml });
+              set((s) => {
+                const nextPending = { ...s.pendingText };
+                const nextRev = { ...s.pendingTextRev };
+                delete nextPending[tempId];
+                delete nextRev[tempId];
+                return { pendingText: nextPending, pendingTextRev: nextRev };
+              });
+            } catch {
+              /* ignore */
+            }
+          }
+
+          // ✅ flush pendingOps：只打服务端，不重复 UI 移动（关键修复）
+          const op = st2.pendingOps[tempId];
+          if (op?.indent) {
+            set((s) => {
+              const next = { ...s.pendingOps };
+              delete next[tempId];
+              return { pendingOps: next };
+            });
+            void serverIndentOnly(tempId, op.indent.fromParentId, op.indent.toParentId, nonce);
+          } else if (op?.outdent) {
+            set((s) => {
+              const next = { ...s.pendingOps };
+              delete next[tempId];
+              return { pendingOps: next };
+            });
+            void serverOutdentOnly(tempId, op.outdent.fromParentId, op.outdent.toParentId, nonce);
+          } else {
+            set((s) => {
+              const next = { ...s.pendingOps };
+              delete next[tempId];
+              return { pendingOps: next };
+            });
+          }
+
+          void get().loadChildren(parentId).catch(console.error);
+
+          set((s) => {
+            const next = { ...s.pendingCreate };
+            delete next[tempId];
+            return { pendingCreate: next };
+          });
+        } catch (e) {
+          console.error("[createAfter] create failed:", safeGetErrorMessage(e));
+          void get().loadChildren(parentId).catch(console.error);
         }
+      })();
+    },
 
-        // 背景校准（不会造成 key 替换，所以不会丢光标）
-        void get().loadChildren(parentId).catch(console.error);
+    deleteIfEmpty: async (id) => {
+      const st0 = get();
+      const nonce = st0.sessionNonce;
 
+      const node = st0.nodes[id];
+      const parentId = node?.parentId;
+      if (!node || !parentId) return;
+
+      const parent = st0.nodes[parentId];
+      if (!parent) return;
+
+      if (!normalizeHtmlEmpty(node.content)) return;
+
+      const idx = parent.children.indexOf(id);
+      const fallbackFocus =
+        (idx > 0 ? parent.children[idx - 1] : parent.children[idx + 1]) ?? parentId;
+
+      const realId = resolveIdForApi(st0, id);
+      const isReal = !isTempId(realId);
+
+      if (isTempId(id)) {
         set((s) => {
-          const next = { ...s.pendingCreate };
-          delete next[tempId];
-          return { pendingCreate: next };
+          const pc = s.pendingCreate[id];
+          if (!pc) return s;
+          return { pendingCreate: { ...s.pendingCreate, [id]: { ...pc, canceled: true } } };
         });
-      } catch (e) {
-        console.error("[createAfter] create failed:", safeGetErrorMessage(e));
-        void get().loadChildren(parentId).catch(console.error);
       }
-    })();
-  },
 
-  deleteIfEmpty: async (id) => {
-    const st0 = get();
-    const nonce = st0.sessionNonce;
+      if (isReal) {
+        set((s) => ({ tombstoneReal: { ...s.tombstoneReal, [realId]: Date.now() } }));
+      }
 
-    const node = st0.nodes[id];
-    const parentId = node?.parentId;
-    if (!node || !parentId) return;
-
-    const parent = st0.nodes[parentId];
-    if (!parent) return;
-
-    if (!normalizeHtmlEmpty(node.content)) return;
-
-    // temp 秒删：标记 canceled，让 create 成功后自动删 real
-    if (isTempId(id)) {
       set((s) => {
-        const pc = s.pendingCreate[id];
-        if (!pc) return s;
-        return { pendingCreate: { ...s.pendingCreate, [id]: { ...pc, canceled: true } } };
+        const p = s.nodes[parentId];
+        if (!p) return s;
+
+        const nextNodes: Record<string, UiNode> = { ...s.nodes };
+        delete nextNodes[id];
+
+        const nextPending = { ...s.pendingText };
+        delete nextPending[id];
+
+        const nextRev = { ...s.pendingTextRev };
+        delete nextRev[id];
+
+        const maybeReal = s.nodes[id]?.serverId;
+        const nextRealToTemp = { ...s.realToTemp };
+        if (maybeReal) delete nextRealToTemp[maybeReal];
+
+        nextNodes[parentId] = {
+          ...p,
+          children: removeFromArray(p.children, id),
+          hasChildren: p.children.length - 1 > 0,
+        };
+
+        const reordered = recomputeOrderIndices(
+          { ...(s as any), nodes: nextNodes, pendingText: nextPending, pendingTextRev: nextRev } as any,
+          parentId
+        );
+
+        return {
+          nodes: reordered ?? nextNodes,
+          pendingText: nextPending,
+          pendingTextRev: nextRev,
+          realToTemp: nextRealToTemp,
+          focusedId: fallbackFocus,
+          caretToEndId: fallbackFocus,
+        };
       });
-    }
 
-    const idx = parent.children.indexOf(id);
-    const fallbackFocus =
-      (idx > 0 ? parent.children[idx - 1] : parent.children[idx + 1]) ?? parentId;
+      get().bumpSidebar();
 
-    // UI 立即删除
-    set((s) => {
-      const p = s.nodes[parentId];
-      if (!p) return s;
-
-      const nextNodes: Record<string, UiNode> = { ...s.nodes };
-      delete nextNodes[id];
-
-      const nextPending = { ...s.pendingText };
-      delete nextPending[id];
-
-      const nextRev = { ...s.pendingTextRev };
-      delete nextRev[id];
-
-      const nextRedirect = { ...s.idRedirect };
-      delete nextRedirect[id];
-
-      // 如果这是 temp 且有 serverId，把 reverse map 也删掉
-      const realId = s.nodes[id]?.serverId;
-      const nextRealToTemp = { ...s.realToTemp };
-      if (realId) delete nextRealToTemp[realId];
-
-      nextNodes[parentId] = {
-        ...p,
-        children: removeFromArray(p.children, id),
-        hasChildren: p.children.length - 1 > 0,
-      };
-
-      const reordered = recomputeOrderIndices(
-        { ...s, nodes: nextNodes, pendingText: nextPending, pendingTextRev: nextRev } as any,
-        parentId
-      );
-
-      return {
-        nodes: reordered ?? nextNodes,
-        pendingText: nextPending,
-        pendingTextRev: nextRev,
-        idRedirect: nextRedirect,
-        realToTemp: nextRealToTemp,
-        focusedId: fallbackFocus,
-        caretToEndId: fallbackFocus,
-      };
-    });
-
-    get().bumpSidebar();
-
-    // 后台删除：若 temp 没落地会 404，忽略即可
-    const apiId = resolveIdForApi(get(), id);
-
-    void (async () => {
-      try {
-        await api.deleteNode(apiId);
-        if (get().sessionNonce !== nonce) return;
-        void get().loadChildren(parentId).catch(console.error);
-      } catch (e) {
-        if (!isHttp404(e)) {
-          console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
+      void (async () => {
+        try {
+          if (!isTempId(realId)) {
+            await api.deleteNode(realId);
+          }
+          if (get().sessionNonce !== nonce) return;
+          void get().loadChildren(parentId).catch(console.error);
+        } catch (e) {
+          if (!isHttp404(e)) console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
+          void get().loadChildren(parentId).catch(console.error);
         }
-        void get().loadChildren(parentId).catch(console.error);
+      })();
+    },
+
+    indent: async (id) => {
+      const st0 = get();
+      const nonce = st0.sessionNonce;
+
+      const node = st0.nodes[id];
+      if (!node) return;
+
+      const oldParentId = node.parentId;
+      if (!oldParentId) return;
+
+      const oldParent = st0.nodes[oldParentId];
+      if (!oldParent) return;
+
+      const idx = oldParent.children.indexOf(id);
+      if (idx <= 0) return;
+
+      const newParentId = oldParent.children[idx - 1];
+      const newParent = st0.nodes[newParentId];
+      if (!newParent) return;
+
+      // UI 立即移动
+      set((s) => {
+        const op = s.nodes[oldParentId];
+        const np = s.nodes[newParentId];
+        const n = s.nodes[id];
+        if (!op || !np || !n) return s;
+
+        const nextNodes: Record<string, UiNode> = { ...s.nodes };
+
+        nextNodes[oldParentId] = {
+          ...op,
+          children: removeFromArray(op.children, id),
+          hasChildren: op.children.length - 1 > 0,
+        };
+
+        nextNodes[newParentId] = {
+          ...np,
+          children: [...np.children, id],
+          hasChildren: true,
+          isCollapsed: false,
+        };
+
+        nextNodes[id] = { ...n, parentId: newParentId };
+
+        const s1 = recomputeOrderIndices({ ...(s as any), nodes: nextNodes } as any, oldParentId);
+        const s2 = recomputeOrderIndices({ ...(s as any), nodes: s1 ?? nextNodes } as any, newParentId);
+
+        return { nodes: s2 ?? s1 ?? nextNodes, focusedId: id };
+      });
+
+      get().bumpSidebar();
+
+      const st1 = get();
+      const apiId = resolveIdForApi(st1, id);
+
+      // temp 未落地：记录 from/to，落地后只打服务端（不重复 UI 移动）
+      if (isTempId(id) && !st1.nodes[id]?.serverId) {
+        set((s) => ({
+          pendingOps: {
+            ...s.pendingOps,
+            [id]: { ...(s.pendingOps[id] ?? {}), indent: { fromParentId: oldParentId, toParentId: newParentId } },
+          },
+        }));
+        return;
       }
-    })();
-  },
 
-  /**
-   * ✅✅ Tab 缩进：
-   * - UI 立即移动（即使是 temp）
-   * - 若 temp 未落地：只记录 pendingOps，等落地后再打 API（不会 404）
-   * - 若已落地：直接打 API + 背景校准
-   */
-  indent: async (id) => {
-    const st0 = get();
-    const nonce = st0.sessionNonce;
+      if (isTempId(apiId)) return;
 
-    const node = st0.nodes[id];
-    if (!node) return;
+      void serverIndentOnly(id, oldParentId, newParentId, nonce);
+    },
 
-    const oldParentId = node.parentId;
-    if (!oldParentId) return;
+    outdent: async (id) => {
+      const st0 = get();
+      const nonce = st0.sessionNonce;
 
-    const oldParent = st0.nodes[oldParentId];
-    if (!oldParent) return;
+      const node = st0.nodes[id];
+      if (!node) return;
 
-    const idx = oldParent.children.indexOf(id);
-    if (idx <= 0) return;
+      const parentId = node.parentId;
+      if (!parentId) return;
 
-    const newParentId = oldParent.children[idx - 1];
-    const newParent = st0.nodes[newParentId];
-    if (!newParent) return;
+      const parent = st0.nodes[parentId];
+      if (!parent) return;
 
-    // 1) UI 立即移动（不管是否 temp）
-    set((s) => {
-      const op = s.nodes[oldParentId];
-      const np = s.nodes[newParentId];
-      const n = s.nodes[id];
-      if (!op || !np || !n) return s;
+      const grandParentId = parent.parentId;
+      if (!grandParentId) return;
 
-      const nextNodes: Record<string, UiNode> = { ...s.nodes };
+      const grand = st0.nodes[grandParentId];
+      if (!grand) return;
 
-      nextNodes[oldParentId] = {
-        ...op,
-        children: removeFromArray(op.children, id),
-        hasChildren: op.children.length - 1 > 0,
-      };
+      const afterId = parentId;
 
-      nextNodes[newParentId] = {
-        ...np,
-        children: [...np.children, id],
-        hasChildren: true,
-        isCollapsed: false,
-      };
+      // UI 立即移动
+      set((s) => {
+        const p = s.nodes[parentId];
+        const g = s.nodes[grandParentId];
+        const n = s.nodes[id];
+        if (!p || !g || !n) return s;
 
-      nextNodes[id] = { ...n, parentId: newParentId };
+        const nextNodes: Record<string, UiNode> = { ...s.nodes };
 
-      const s1 = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, oldParentId);
-      const s2 = recomputeOrderIndices({ ...s, nodes: s1 ?? nextNodes } as any, newParentId);
+        nextNodes[parentId] = {
+          ...p,
+          children: removeFromArray(p.children, id),
+          hasChildren: p.children.length - 1 > 0,
+        };
 
-      return {
-        nodes: s2 ?? s1 ?? nextNodes,
-        focusedId: id,
-      };
-    });
+        nextNodes[grandParentId] = {
+          ...g,
+          children: insertAfter(g.children, afterId, id),
+          hasChildren: true,
+          isCollapsed: false,
+        };
 
-    get().bumpSidebar();
+        nextNodes[id] = { ...n, parentId: grandParentId };
 
-    // 2) 若 temp 未落地：排队，不打 API（防 404）
-    const st1 = get();
-    const apiId = resolveIdForApi(st1, id);
-    if (isTempId(id) && !st1.nodes[id]?.serverId && apiId === id) {
-      set((s) => ({
-        pendingOps: {
-          ...s.pendingOps,
-          [id]: { ...(s.pendingOps[id] ?? {}), indent: true },
-        },
-      }));
-      return;
-    }
+        const s1 = recomputeOrderIndices({ ...(s as any), nodes: nextNodes } as any, parentId);
+        const s2 = recomputeOrderIndices({ ...(s as any), nodes: s1 ?? nextNodes } as any, grandParentId);
 
-    // 3) 后台同步
-    void (async () => {
-      try {
-        await api.indentNode(resolveIdForApi(get(), id));
-        if (get().sessionNonce !== nonce) return;
+        return { nodes: s2 ?? s1 ?? nextNodes, focusedId: id };
+      });
 
-        void get().loadChildren(newParentId).catch(console.error);
-        void get().loadChildren(oldParentId).catch(console.error);
-      } catch (e) {
-        if (!isHttp404(e)) console.error("[indent] failed:", safeGetErrorMessage(e));
-        void get().loadChildren(oldParentId).catch(console.error);
-        void get().loadChildren(newParentId).catch(console.error);
+      get().bumpSidebar();
+
+      const st1 = get();
+      const apiId = resolveIdForApi(st1, id);
+
+      if (isTempId(id) && !st1.nodes[id]?.serverId) {
+        set((s) => ({
+          pendingOps: {
+            ...s.pendingOps,
+            [id]: { ...(s.pendingOps[id] ?? {}), outdent: { fromParentId: parentId, toParentId: grandParentId } },
+          },
+        }));
+        return;
       }
-    })();
-  },
 
-  outdent: async (id) => {
-    const st0 = get();
-    const nonce = st0.sessionNonce;
+      if (isTempId(apiId)) return;
 
-    const node = st0.nodes[id];
-    if (!node) return;
+      void serverOutdentOnly(id, parentId, grandParentId, nonce);
+    },
 
-    const parentId = node.parentId;
-    if (!parentId) return;
-
-    const parent = st0.nodes[parentId];
-    if (!parent) return;
-
-    const grandParentId = parent.parentId;
-    if (!grandParentId) return;
-
-    const grand = st0.nodes[grandParentId];
-    if (!grand) return;
-
-    const afterId = parentId;
-
-    // 1) UI 立即移动
-    set((s) => {
-      const p = s.nodes[parentId];
-      const g = s.nodes[grandParentId];
-      const n = s.nodes[id];
-      if (!p || !g || !n) return s;
-
-      const nextNodes: Record<string, UiNode> = { ...s.nodes };
-
-      nextNodes[parentId] = {
-        ...p,
-        children: removeFromArray(p.children, id),
-        hasChildren: p.children.length - 1 > 0,
-      };
-
-      nextNodes[grandParentId] = {
-        ...g,
-        children: insertAfter(g.children, afterId, id),
-        hasChildren: true,
-        isCollapsed: false,
-      };
-
-      nextNodes[id] = { ...n, parentId: grandParentId };
-
-      const s1 = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
-      const s2 = recomputeOrderIndices({ ...s, nodes: s1 ?? nextNodes } as any, grandParentId);
-
-      return { nodes: s2 ?? s1 ?? nextNodes, focusedId: id };
-    });
-
-    get().bumpSidebar();
-
-    // 2) temp 未落地：排队
-    const st1 = get();
-    const apiId = resolveIdForApi(st1, id);
-    if (isTempId(id) && !st1.nodes[id]?.serverId && apiId === id) {
-      set((s) => ({
-        pendingOps: {
-          ...s.pendingOps,
-          [id]: { ...(s.pendingOps[id] ?? {}), outdent: true },
-        },
-      }));
-      return;
-    }
-
-    // 3) 后台同步
-    void (async () => {
-      try {
-        await api.outdentNode(resolveIdForApi(get(), id));
-        if (get().sessionNonce !== nonce) return;
-
-        void get().loadChildren(parentId).catch(console.error);
-        void get().loadChildren(grandParentId).catch(console.error);
-      } catch (e) {
-        if (!isHttp404(e)) console.error("[outdent] failed:", safeGetErrorMessage(e));
-        void get().loadChildren(parentId).catch(console.error);
-        void get().loadChildren(grandParentId).catch(console.error);
-      }
-    })();
-  },
-
-  moveFocusUp: () => {},
-  moveFocusDown: () => {},
-}));
+    moveFocusUp: () => {},
+    moveFocusDown: () => {},
+  };
+});
