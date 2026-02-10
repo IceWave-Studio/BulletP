@@ -3,10 +3,6 @@ import { useEffect, useRef } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useStore } from "../store";
 
-/* =========================
- * Utils
- * ========================= */
-
 function cleanupZwsp(html: string) {
   return html.replace(/\u200B/g, "");
 }
@@ -19,10 +15,6 @@ function moveCaretToEnd(el: HTMLElement) {
   sel?.removeAllRanges();
   sel?.addRange(range);
 }
-
-/* =========================
- * Component
- * ========================= */
 
 export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const node = useStore((s) => s.nodes[id]);
@@ -47,8 +39,9 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const editorRef = useRef<HTMLDivElement | null>(null);
 
   const pendingTimerRef = useRef<number | null>(null);
-  const lastCommittedRef = useRef<string>("");
+  const rafFlushRef = useRef<number | null>(null);
 
+  const lastCommittedRef = useRef<string>("");
   const composingRef = useRef(false);
 
   const isFocused = focusedId === id;
@@ -57,37 +50,29 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const hasChildren =
     ((node?.hasChildren ?? false) || (node?.children?.length ?? 0) > 0) && !!node;
 
-  /* =========================
-   * Timer helpers
-   * ========================= */
-
   const clearPending = () => {
     if (pendingTimerRef.current) {
       window.clearTimeout(pendingTimerRef.current);
       pendingTimerRef.current = null;
     }
+    if (rafFlushRef.current) {
+      cancelAnimationFrame(rafFlushRef.current);
+      rafFlushRef.current = null;
+    }
   };
 
   useEffect(() => {
     return () => clearPending();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* =========================
-   * Initial mount: set DOM once
-   * ========================= */
-
+  // ✅ 只在 mount/节点切换时写一次 DOM，避免“输入被回写打断”
   useEffect(() => {
     const el = editorRef.current;
     if (!el || !node) return;
-
-    // ✅ 只在首次 mount / 节点切换时写 DOM
     el.innerHTML = node.content ?? "";
     lastCommittedRef.current = node.content ?? "";
-  }, [id]); // ❗ 只依赖 id
-
-  /* =========================
-   * Focus handling (NO DOM WRITE)
-   * ========================= */
+  }, [id]); // 只依赖 id
 
   useEffect(() => {
     if (!isFocused) return;
@@ -97,7 +82,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   useEffect(() => {
     if (!isFocused) return;
     if (caretToEndId !== id) return;
-
     const el = editorRef.current;
     if (!el) return;
 
@@ -106,10 +90,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
       setCaretToEndId(null);
     });
   }, [isFocused, caretToEndId, id, setCaretToEndId]);
-
-  /* =========================
-   * Flush logic
-   * ========================= */
 
   const flushToStore = () => {
     const el = editorRef.current;
@@ -123,14 +103,18 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   };
 
   const scheduleFlush = () => {
-    // temp 节点立即 flush，避免被替换时丢输入
+    // ✅ temp：用 rAF 合并 flush（避免每键 setState 抖动）
     if (isTemp) {
-      clearPending();
-      flushToStore();
+      if (rafFlushRef.current) return;
+      rafFlushRef.current = requestAnimationFrame(() => {
+        rafFlushRef.current = null;
+        if (composingRef.current) return;
+        flushToStore();
+      });
       return;
     }
 
-    clearPending();
+    if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
     pendingTimerRef.current = window.setTimeout(() => {
       pendingTimerRef.current = null;
       if (composingRef.current) return;
@@ -141,10 +125,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   if (!node) return null;
 
   const bulletCollapsed = hasChildren && !!node.isCollapsed;
-
-  /* =========================
-   * Render
-   * ========================= */
 
   return (
     <div className="flex flex-col">
@@ -158,7 +138,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           margin: "6px 0",
         }}
       >
-        {/* Collapse icon */}
         <div
           style={{
             width: 18,
@@ -180,7 +159,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           )}
         </div>
 
-        {/* Bullet */}
         <div
           className={`bp-bullet-wrap ${bulletCollapsed ? "bp-bullet-collapsed" : ""}`}
           onMouseDown={(e) => e.preventDefault()}
@@ -190,12 +168,11 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           }}
           title="Zoom In"
         >
-          <svg width="12" height="12" viewBox="0 0 8 8" className="bp-bullet-dot">
+          <svg width="12" height="12" viewBox="0 0 8 8" className="bp-bullet-dot" aria-hidden="true">
             <circle cx="4" cy="4" r="3" />
           </svg>
         </div>
 
-        {/* Editor */}
         <div style={{ flex: "1 1 auto", minWidth: 0 }}>
           <div
             ref={editorRef}
@@ -220,7 +197,8 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
               const ime =
                 composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
 
-              if (e.key === "Enter" && !ime) {
+              if (e.key === "Enter") {
+                if (ime) return;
                 e.preventDefault();
                 clearPending();
                 flushToStore();
@@ -228,9 +206,10 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
                 return;
               }
 
-              if (e.key === "Backspace" && !ime) {
+              if (e.key === "Backspace") {
+                if (ime) return;
                 const el = editorRef.current;
-                const plain = (el?.innerText || "").trim();
+                const plain = (el?.innerText || "").replace(/\u200B/g, "").trim();
                 if (plain.length === 0) {
                   e.preventDefault();
                   clearPending();

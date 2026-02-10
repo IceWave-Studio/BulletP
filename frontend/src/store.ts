@@ -16,7 +16,7 @@ export type UiNode = {
   hasChildren?: boolean;
   isCollapsed?: boolean;
 
-  // ✅ temp 节点落地后对应的真实 id
+  // ✅ temp 节点落地后对应的真实 id（UI 仍用 temp id 做 key，避免重挂载丢光标）
   serverId?: string;
 };
 
@@ -41,7 +41,6 @@ type Store = {
   setAuth: (userId: string, homeId: string, email?: string) => void;
   clearAuth: () => void;
 
-  // bump on every login/logout to invalidate in-flight async
   sessionNonce: number;
 
   // ---------- data ----------
@@ -49,11 +48,9 @@ type Store = {
   rootId: string;
   focusedId: string | null;
 
-  // ✅ sidebar refresh signal
   sidebarVersion: number;
   bumpSidebar: () => void;
 
-  // focus / caret helpers
   caretToEndId: string | null;
   setCaretToEndId: (id: string | null) => void;
 
@@ -70,26 +67,24 @@ type Store = {
 
   toggleCollapse: (id: string) => void;
 
-  // ✅ pending text (and rev) 防止旧回包覆盖最新输入
   pendingText: Record<string, string | undefined>;
   pendingTextRev: Record<string, number | undefined>;
 
-  // ✅ tempId -> realId（用于 API resolve）
+  // tempId -> realId (API resolve)
   idRedirect: Record<string, string | undefined>;
-  // ✅ realId -> tempId（用于 loadChildren 去重，保持 key 稳定）
+  // realId -> tempId (UI stable key)
   realToTemp: Record<string, string | undefined>;
 
-  // ✅ temp create 状态：用于 delete 取消、以及 create 回来后处理
+  // temp create 状态（用于取消）
   pendingCreate: Record<
     string,
     { parentId: string; canceled: boolean; createdRealId?: string | null } | undefined
   >;
 
-  // ✅ 对 temp 做的结构操作队列（Enter 后秒 Tab）
   pendingOps: Record<string, PendingOp | undefined>;
 
-  // ✅ 被用户“本地删掉”的 realId 墓碑：loadChildren 忽略它，避免“又出现”
-  tombstoneReal: Record<string, number | undefined>; // value = timestamp
+  // realId 墓碑，避免 loadChildren 把“已删的 real”拉回
+  tombstoneReal: Record<string, number | undefined>;
 
   updateContent: (id: string, html: string) => Promise<void>;
 
@@ -111,15 +106,20 @@ function isTempId(id: string) {
   return id.startsWith("tmp_");
 }
 
+function isHttp404(err: any) {
+  const msg = String(err?.message || "");
+  return msg.includes("HTTP 404");
+}
+
+function safeGetErrorMessage(err: any) {
+  return String(err?.message || err || "");
+}
+
 function normalizeHasChildren(n: any, existing?: UiNode) {
   const hint = n?.has_children !== undefined ? Boolean(n.has_children) : existing?.hasChildren;
   return hint;
 }
 
-/**
- * ✅ upsertFromApiToUiId：把 API real 节点写到指定 uiId（可能是 temp）
- * pendingText 优先，避免校准覆盖用户正在输入的内容
- */
 function upsertFromApiToUiId(state: Store, uiId: string, n: ApiNode): UiNode {
   const existing = state.nodes[uiId];
   const pending = state.pendingText[uiId];
@@ -140,15 +140,6 @@ function upsertFromApiToUiId(state: Store, uiId: string, n: ApiNode): UiNode {
       existing?.isCollapsed !== undefined ? existing.isCollapsed : shouldDefaultCollapsed,
     serverId: existing?.serverId,
   };
-}
-
-function isHttp404(err: any) {
-  const msg = String(err?.message || "");
-  return msg.includes("HTTP 404");
-}
-
-function safeGetErrorMessage(err: any) {
-  return String(err?.message || err || "");
 }
 
 /**
@@ -229,9 +220,22 @@ function resolveIdForApi(state: Store, uiId: string): string {
 }
 
 /**
- * ✅ 合并 children：保留本地顺序（尤其是 temp），再把服务端返回的节点合并进来
+ * ✅ tombstone：短时间内忽略已经“本地删掉”的 realId，避免 loadChildren 拉回
  */
-function mergeChildrenPreserveLocal(
+function isTombstoned(state: Store, realId: string) {
+  const t = state.tombstoneReal[realId];
+  if (!t) return false;
+  return Date.now() - t < 5 * 60 * 1000;
+}
+
+/**
+ * ✅ children 合并：核心修复
+ * 规则：
+ * 1) 本地 children 里只要节点还存在，就保留（尤其 temp）
+ * 2) server 返回的 realId 先映射到 tempId（realToTemp）再合并
+ * 3) 最终顺序：本地顺序优先 + 补齐 server 有但本地没有的
+ */
+function mergeChildrenPreserveLocal_FIXED(
   state: Store,
   uiParentId: string,
   serverChildUiIds: string[]
@@ -243,11 +247,12 @@ function mergeChildrenPreserveLocal(
 
   const kept: string[] = [];
   for (const cid of local) {
-    const isTemp = isTempId(cid);
-    const stillPendingTemp =
-      isTemp && Boolean(state.pendingCreate[cid]) && !state.pendingCreate[cid]?.canceled;
-
-    if (stillPendingTemp || serverSet.has(cid)) kept.push(cid);
+    if (isTempId(cid)) {
+      // ✅ temp 只要还在 nodes 里，就永远保留（根治：不再依赖 pendingCreate）
+      kept.push(cid);
+      continue;
+    }
+    if (serverSet.has(cid)) kept.push(cid);
   }
 
   for (const sid of serverChildUiIds) {
@@ -257,21 +262,12 @@ function mergeChildrenPreserveLocal(
   return kept;
 }
 
-/**
- * ✅ tombstone：短时间内忽略已经“本地删掉”的 realId，避免 loadChildren 拉回
- */
-function isTombstoned(state: Store, realId: string) {
-  const t = state.tombstoneReal[realId];
-  if (!t) return false;
-  return Date.now() - t < 5 * 60 * 1000;
-}
-
 /* =========================
  * Store
  * ========================= */
 
 export const useStore = create<Store>((set, get) => {
-  // ✅ 只打服务端，不重复 UI 移动（关键修复）
+  // ✅ 只打服务端，不重复 UI 移动
   const serverIndentOnly = async (
     uiId: string,
     fromParentId: string,
@@ -449,7 +445,10 @@ export const useStore = create<Store>((set, get) => {
     hydrateNode: (n) =>
       set((s) => {
         const uiId = s.realToTemp[n.id] ?? n.id;
-        return { nodes: { ...s.nodes, [uiId]: upsertFromApiToUiId(s as any, uiId, n) } };
+        const next = { ...s.nodes };
+        next[uiId] = upsertFromApiToUiId(s as any, uiId, n);
+        if (uiId !== n.id) next[uiId] = { ...next[uiId], serverId: n.id };
+        return { nodes: next };
       }),
 
     ensureNodeLoaded: async (id) => {
@@ -459,7 +458,7 @@ export const useStore = create<Store>((set, get) => {
       const st0 = get();
 
       const apiId = resolveIdForApi(st0, id);
-      if (isTempId(apiId)) return; // ✅ 不请求 temp
+      if (isTempId(apiId)) return;
 
       const uiId = st0.realToTemp[apiId] ?? id;
 
@@ -508,7 +507,7 @@ export const useStore = create<Store>((set, get) => {
       const st0 = get();
 
       const apiParentId = resolveIdForApi(st0, parentId);
-      if (isTempId(apiParentId)) return; // ✅ 不请求 temp parent
+      if (isTempId(apiParentId)) return;
 
       const uiParentId = st0.realToTemp[apiParentId] ?? parentId;
 
@@ -549,7 +548,6 @@ export const useStore = create<Store>((set, get) => {
           const uiChildId = s.realToTemp[r.id] ?? r.id;
 
           next[uiChildId] = upsertFromApiToUiId(s as any, uiChildId, r);
-
           if (uiChildId !== r.id) {
             next[uiChildId] = { ...next[uiChildId], serverId: r.id };
           }
@@ -559,7 +557,7 @@ export const useStore = create<Store>((set, get) => {
 
         const existingParent = next[uiParentId];
 
-        const mergedChildren = mergeChildrenPreserveLocal(
+        const mergedChildren = mergeChildrenPreserveLocal_FIXED(
           { ...(s as any), nodes: next } as any,
           uiParentId,
           serverChildUiIds
@@ -643,9 +641,10 @@ export const useStore = create<Store>((set, get) => {
       get().bumpSidebar();
 
       const st1 = get();
-      const node = st1.nodes[id];
+      const n1 = st1.nodes[id];
 
-      if (isTempId(id) && !node?.serverId) return;
+      // temp 未落地：先不打 patch（由 create 落地后补发最后文本）
+      if (isTempId(id) && !n1?.serverId) return;
 
       const apiId = resolveIdForApi(st1, id);
       if (isTempId(apiId)) return;
@@ -676,156 +675,16 @@ export const useStore = create<Store>((set, get) => {
     },
 
     appendChild: async (parentId) => {
-      const st0 = get();
-      const nonce = st0.sessionNonce;
-
-      const p = st0.nodes[parentId];
-      if (!p) return;
-
-      const tempId = newClientId();
-
-      set((s) => {
-        const parent = s.nodes[parentId];
-        if (!parent) return s;
-
-        const nextNodes: Record<string, UiNode> = { ...s.nodes };
-        nextNodes[tempId] = {
-          id: tempId,
-          parentId,
-          content: "",
-          orderIndex: parent.children.length,
-          children: [],
-          hasChildren: false,
-          isCollapsed: false,
-        };
-
-        nextNodes[parentId] = {
-          ...parent,
-          children: [...parent.children, tempId],
-          hasChildren: true,
-          isCollapsed: false,
-        };
-
-        const reordered = recomputeOrderIndices({ ...(s as any), nodes: nextNodes } as any, parentId);
-
-        return {
-          nodes: reordered ?? nextNodes,
-          pendingCreate: {
-            ...s.pendingCreate,
-            [tempId]: { parentId, canceled: false, createdRealId: null },
-          },
-          focusedId: tempId,
-          caretToEndId: tempId,
-        };
-      });
-
-      get().bumpSidebar();
-
-      void (async () => {
-        try {
-          const apiParent = resolveIdForApi(get(), parentId);
-          if (isTempId(apiParent)) return;
-
-          const created = await api.createNode({ parent_id: apiParent, text: "" });
-
-          if (get().sessionNonce !== nonce) return;
-
-          const st1 = get();
-          const pc = st1.pendingCreate[tempId];
-          const tempStillExists = Boolean(st1.nodes[tempId]);
-          const canceled = pc?.canceled === true;
-
-          if (canceled || !tempStillExists) {
-            set((s) => ({
-              tombstoneReal: { ...s.tombstoneReal, [created.id]: Date.now() },
-            }));
-            try {
-              await api.deleteNode(created.id);
-            } catch {
-              /* ignore */
-            }
-            void get().loadChildren(parentId).catch(console.error);
-
-            set((s) => {
-              const next = { ...s.pendingCreate };
-              delete next[tempId];
-              return { pendingCreate: next };
-            });
-
-            return;
-          }
-
-          set((s) => {
-            const tmp = s.nodes[tempId];
-            if (!tmp) return s;
-
-            return {
-              nodes: { ...s.nodes, [tempId]: { ...tmp, serverId: created.id } },
-              idRedirect: { ...s.idRedirect, [tempId]: created.id },
-              realToTemp: { ...s.realToTemp, [created.id]: tempId },
-              pendingCreate: {
-                ...s.pendingCreate,
-                [tempId]: { parentId, canceled: false, createdRealId: created.id },
-              },
-            };
-          });
-
-          get().bumpSidebar();
-
-          // 补发最后一次输入
-          const st2 = get();
-          const latestHtml = st2.pendingText[tempId] ?? st2.nodes[tempId]?.content ?? "";
-          if (latestHtml !== undefined) {
-            try {
-              await api.patchNode(created.id, { text: latestHtml });
-              set((s) => {
-                const nextPending = { ...s.pendingText };
-                const nextRev = { ...s.pendingTextRev };
-                delete nextPending[tempId];
-                delete nextRev[tempId];
-                return { pendingText: nextPending, pendingTextRev: nextRev };
-              });
-            } catch {
-              /* ignore */
-            }
-          }
-
-          // ✅ flush pendingOps：只打服务端，不重复 UI 移动（关键修复）
-          const op = st2.pendingOps[tempId];
-          if (op?.indent) {
-            set((s) => {
-              const next = { ...s.pendingOps };
-              delete next[tempId];
-              return { pendingOps: next };
-            });
-            void serverIndentOnly(tempId, op.indent.fromParentId, op.indent.toParentId, nonce);
-          } else if (op?.outdent) {
-            set((s) => {
-              const next = { ...s.pendingOps };
-              delete next[tempId];
-              return { pendingOps: next };
-            });
-            void serverOutdentOnly(tempId, op.outdent.fromParentId, op.outdent.toParentId, nonce);
-          } else {
-            set((s) => {
-              const next = { ...s.pendingOps };
-              delete next[tempId];
-              return { pendingOps: next };
-            });
-          }
-
-          void get().loadChildren(parentId).catch(console.error);
-
-          set((s) => {
-            const next = { ...s.pendingCreate };
-            delete next[tempId];
-            return { pendingCreate: next };
-          });
-        } catch (e) {
-          console.error("[appendChild] create failed:", safeGetErrorMessage(e));
-          void get().loadChildren(parentId).catch(console.error);
-        }
-      })();
+      // 非核心交互，不动
+      const nonce = get().sessionNonce;
+      try {
+        await api.createNode({ parent_id: resolveIdForApi(get(), parentId), text: "" });
+      } catch (e) {
+        console.error("[appendChild] create failed:", safeGetErrorMessage(e));
+        return;
+      }
+      if (get().sessionNonce !== nonce) return;
+      await get().loadChildren(parentId);
     },
 
     createAfter: async (id) => {
@@ -838,11 +697,9 @@ export const useStore = create<Store>((set, get) => {
       const parentId = cur.parentId ?? st0.homeId;
       if (!parentId) return;
 
-      const parent = st0.nodes[parentId];
-      if (!parent) return;
-
       const tempId = newClientId();
 
+      // 1) UI 立刻插入 temp（0ms）
       set((s) => {
         const p = s.nodes[parentId];
         if (!p) return s;
@@ -866,7 +723,6 @@ export const useStore = create<Store>((set, get) => {
         };
 
         const reordered = recomputeOrderIndices({ ...(s as any), nodes: nextNodes } as any, parentId);
-
         return {
           nodes: reordered ?? nextNodes,
           pendingCreate: {
@@ -880,12 +736,13 @@ export const useStore = create<Store>((set, get) => {
 
       get().bumpSidebar();
 
+      // 2) 后台 create（不阻塞 UI）
       void (async () => {
         try {
-          let created: ApiNode;
-
           const apiParent = resolveIdForApi(get(), parentId);
           if (isTempId(apiParent)) return;
+
+          let created: ApiNode;
 
           try {
             const apiAfter = resolveIdForApi(get(), id);
@@ -907,9 +764,10 @@ export const useStore = create<Store>((set, get) => {
 
           const st1 = get();
           const pc = st1.pendingCreate[tempId];
-          const tempStillExists = Boolean(st1.nodes[tempId]);
           const canceled = pc?.canceled === true;
+          const tempStillExists = Boolean(st1.nodes[tempId]);
 
+          // 如果用户在 create 回来前已经删了 temp：直接删 real，并 tombstone
           if (canceled || !tempStillExists) {
             set((s) => ({
               tombstoneReal: { ...s.tombstoneReal, [created.id]: Date.now() },
@@ -920,30 +778,22 @@ export const useStore = create<Store>((set, get) => {
               /* ignore */
             }
             void get().loadChildren(parentId).catch(console.error);
-
-            set((s) => {
-              const next = { ...s.pendingCreate };
-              delete next[tempId];
-              return { pendingCreate: next };
-            });
-
             return;
           }
 
-          set((s) => {
-            const tmp = s.nodes[tempId];
-            if (!tmp) return s;
-
-            return {
-              nodes: { ...s.nodes, [tempId]: { ...tmp, serverId: created.id } },
-              idRedirect: { ...s.idRedirect, [tempId]: created.id },
-              realToTemp: { ...s.realToTemp, [created.id]: tempId },
-              pendingCreate: {
-                ...s.pendingCreate,
-                [tempId]: { parentId, canceled: false, createdRealId: created.id },
-              },
-            };
-          });
+          // 绑定 realId 到 temp 节点（UI id 不变！）
+          set((s) => ({
+            nodes: {
+              ...s.nodes,
+              [tempId]: { ...s.nodes[tempId], serverId: created.id },
+            },
+            idRedirect: { ...s.idRedirect, [tempId]: created.id },
+            realToTemp: { ...s.realToTemp, [created.id]: tempId },
+            pendingCreate: {
+              ...s.pendingCreate,
+              [tempId]: { parentId, canceled: false, createdRealId: created.id },
+            },
+          }));
 
           get().bumpSidebar();
 
@@ -965,8 +815,8 @@ export const useStore = create<Store>((set, get) => {
             }
           }
 
-          // ✅ flush pendingOps：只打服务端，不重复 UI 移动（关键修复）
-          const op = st2.pendingOps[tempId];
+          // flush pendingOps（只 server-only）
+          const op = get().pendingOps[tempId];
           if (op?.indent) {
             set((s) => {
               const next = { ...s.pendingOps };
@@ -990,12 +840,6 @@ export const useStore = create<Store>((set, get) => {
           }
 
           void get().loadChildren(parentId).catch(console.error);
-
-          set((s) => {
-            const next = { ...s.pendingCreate };
-            delete next[tempId];
-            return { pendingCreate: next };
-          });
         } catch (e) {
           console.error("[createAfter] create failed:", safeGetErrorMessage(e));
           void get().loadChildren(parentId).catch(console.error);
@@ -1048,8 +892,8 @@ export const useStore = create<Store>((set, get) => {
         const nextRev = { ...s.pendingTextRev };
         delete nextRev[id];
 
-        const maybeReal = s.nodes[id]?.serverId;
         const nextRealToTemp = { ...s.realToTemp };
+        const maybeReal = s.nodes[id]?.serverId;
         if (maybeReal) delete nextRealToTemp[maybeReal];
 
         nextNodes[parentId] = {
@@ -1059,7 +903,7 @@ export const useStore = create<Store>((set, get) => {
         };
 
         const reordered = recomputeOrderIndices(
-          { ...(s as any), nodes: nextNodes, pendingText: nextPending, pendingTextRev: nextRev } as any,
+          { ...(s as any), nodes: nextNodes } as any,
           parentId
         );
 
@@ -1144,12 +988,14 @@ export const useStore = create<Store>((set, get) => {
       const st1 = get();
       const apiId = resolveIdForApi(st1, id);
 
-      // temp 未落地：记录 from/to，落地后只打服务端（不重复 UI 移动）
       if (isTempId(id) && !st1.nodes[id]?.serverId) {
         set((s) => ({
           pendingOps: {
             ...s.pendingOps,
-            [id]: { ...(s.pendingOps[id] ?? {}), indent: { fromParentId: oldParentId, toParentId: newParentId } },
+            [id]: {
+              ...(s.pendingOps[id] ?? {}),
+              indent: { fromParentId: oldParentId, toParentId: newParentId },
+            },
           },
         }));
         return;
@@ -1220,7 +1066,10 @@ export const useStore = create<Store>((set, get) => {
         set((s) => ({
           pendingOps: {
             ...s.pendingOps,
-            [id]: { ...(s.pendingOps[id] ?? {}), outdent: { fromParentId: parentId, toParentId: grandParentId } },
+            [id]: {
+              ...(s.pendingOps[id] ?? {}),
+              outdent: { fromParentId: parentId, toParentId: grandParentId },
+            },
           },
         }));
         return;
