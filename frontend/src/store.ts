@@ -66,6 +66,7 @@ type Store = {
   pendingText: Record<string, string | undefined>;
 
   updateContent: (id: string, html: string) => Promise<void>;
+
   appendChild: (parentId: string) => Promise<void>;
   createAfter: (id: string) => Promise<void>;
   deleteIfEmpty: (id: string) => Promise<void>;
@@ -139,8 +140,56 @@ function mergeTextOnly(existing: UiNode | undefined, updated: ApiNode): UiNode {
   return {
     ...existing,
     content: updated.text ?? existing.content,
-    // ✅ 不动 parentId / orderIndex / children（以当前 UI 为准）
   };
+}
+
+function newClientId(): string {
+  // modern browsers ok
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return (crypto as any).randomUUID();
+  }
+  // fallback
+  return `tmp_${Math.random().toString(16).slice(2)}_${Date.now()}`;
+}
+
+function normalizeHtmlEmpty(html: string) {
+  const t = html.replace(/\u200B/g, "").trim();
+  return t === "" || t === "<br>";
+}
+
+function removeFromArray(arr: string[], id: string) {
+  const idx = arr.indexOf(id);
+  if (idx < 0) return arr.slice();
+  return [...arr.slice(0, idx), ...arr.slice(idx + 1)];
+}
+
+function replaceInArray(arr: string[], from: string, to: string) {
+  const idx = arr.indexOf(from);
+  if (idx < 0) return arr.slice();
+  const next = arr.slice();
+  next[idx] = to;
+  return next;
+}
+
+function insertAfter(arr: string[], afterId: string, newId: string) {
+  const idx = arr.indexOf(afterId);
+  if (idx < 0) return [...arr, newId];
+  return [...arr.slice(0, idx + 1), newId, ...arr.slice(idx + 1)];
+}
+
+function recomputeOrderIndices(state: Store, parentId: string) {
+  const p = state.nodes[parentId];
+  if (!p) return;
+  const nextNodes: Record<string, UiNode> = { ...state.nodes };
+  const children = p.children;
+  for (let i = 0; i < children.length; i++) {
+    const cid = children[i];
+    const cn = nextNodes[cid];
+    if (!cn) continue;
+    nextNodes[cid] = { ...cn, orderIndex: i };
+  }
+  nextNodes[parentId] = { ...p, hasChildren: children.length > 0 };
+  return nextNodes;
 }
 
 /* =========================
@@ -186,7 +235,6 @@ export const useStore = create<Store>((set, get) => ({
       focusedId: null,
       sessionNonce: s.sessionNonce + 1,
 
-      // ✅ 切账号保险：清空缓存，避免旧 id 404 / 白屏
       nodes: {},
       pendingText: {},
       _inflightNodeFetch: {},
@@ -257,7 +305,6 @@ export const useStore = create<Store>((set, get) => ({
       return { nodes: next, homeId: home.id, rootId: home.id };
     });
 
-    // ✅ children 拉取完成后会 bumpSidebar（见 loadChildren）
     await get().loadChildren(home.id);
   },
 
@@ -334,13 +381,11 @@ export const useStore = create<Store>((set, get) => ({
           return { nodes: next };
         });
 
-        // ✅ 重要：sidebar 不订阅 nodes，所以这里也要 bump 一下，避免卡在旧 UI
         get().bumpSidebar();
         return;
       }
 
       console.error("[loadChildren] failed:", safeGetErrorMessage(e));
-      // 同样 bump 一下，避免 sidebar 卡住（可选）
       get().bumpSidebar();
       return;
     }
@@ -370,7 +415,6 @@ export const useStore = create<Store>((set, get) => ({
       return { nodes: next };
     });
 
-    // ✅✅ 关键修复：children 拉完后，让 sidebar 重新计算 rows
     get().bumpSidebar();
   },
 
@@ -408,14 +452,11 @@ export const useStore = create<Store>((set, get) => ({
       void get().loadChildren(id).catch(console.error);
     }
 
-    // ✅ 折叠/展开也属于 sidebar 需要更新的动作
     get().bumpSidebar();
   },
 
   /**
-   * ✅ 根治竞态：
-   * - optimistic + pendingText
-   * - PATCH 成功：只合并 content（不要覆盖 parentId/orderIndex）
+   * ✅ updateContent 已经是 optimistic，不会阻塞交互
    */
   updateContent: async (id, html) => {
     if (!id) return;
@@ -453,6 +494,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   appendChild: async (parentId) => {
+    // 这个不是核心交互（可慢），先不动
     const nonce = get().sessionNonce;
 
     try {
@@ -463,156 +505,346 @@ export const useStore = create<Store>((set, get) => ({
     }
 
     if (get().sessionNonce !== nonce) return;
-
     await get().loadChildren(parentId);
-    // loadChildren 已 bumpSidebar
   },
 
+  /**
+   * ✅✅ 根治 Enter 延迟：
+   * - 本地立即插入一个临时节点（0ms）
+   * - 立即 focus 到临时节点（0ms）
+   * - 后台调用 createNode(after_id)，成功后把临时 id 替换为真实 id
+   * - 后台 loadChildren 校准（不 await，不阻塞）
+   */
   createAfter: async (id) => {
-    const nonce = get().sessionNonce;
-    const st = get();
+    const st0 = get();
+    const nonce = st0.sessionNonce;
 
-    const node = st.nodes[id];
-    if (!node) return;
+    const cur = st0.nodes[id];
+    if (!cur) return;
 
-    const parentId = node.parentId ?? st.homeId;
+    const parentId = cur.parentId ?? st0.homeId;
     if (!parentId) return;
 
-    let created: ApiNode;
-    try {
-      created = await api.createNode({ parent_id: parentId, text: "" });
-    } catch (e) {
-      console.error("[createAfter] create failed:", safeGetErrorMessage(e));
-      return;
-    }
+    const parent = st0.nodes[parentId];
+    if (!parent) return;
 
-    if (get().sessionNonce !== nonce) return;
+    // 1) 本地立即插入 temp node
+    const tempId = newClientId();
 
-    await st.loadChildren(parentId);
+    set((s) => {
+      const p = s.nodes[parentId];
+      if (!p) return s;
 
-    const latest = get();
-    const idx = (latest.nodes[parentId]?.children ?? []).indexOf(id) + 1;
+      const nextNodes: Record<string, UiNode> = { ...s.nodes };
+      nextNodes[tempId] = {
+        id: tempId,
+        parentId,
+        content: "",
+        orderIndex: 0,
+        children: [],
+        hasChildren: false,
+        isCollapsed: false,
+      };
 
-    try {
-      await api.moveNode(created.id, {
-        new_parent_id: parentId,
-        new_order_index: idx,
-      });
-    } catch (e) {
-      console.error("[createAfter] move failed:", safeGetErrorMessage(e));
-    }
+      nextNodes[parentId] = {
+        ...p,
+        children: insertAfter(p.children, id, tempId),
+        hasChildren: true,
+        isCollapsed: false,
+      };
 
-    await st.loadChildren(parentId);
+      const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+      return {
+        nodes: reordered ?? nextNodes,
+        focusedId: tempId,
+        caretToEndId: tempId,
+      };
+    });
 
-    set({ focusedId: created.id, caretToEndId: created.id });
     get().bumpSidebar();
-  },
 
-  deleteIfEmpty: async (id) => {
-    const nonce = get().sessionNonce;
-    const st = get();
-    const node = st.nodes[id];
-    if (!node?.parentId) return;
+    // 2) 后台同步到服务器（绝不 await 阻塞 UI）
+    void (async () => {
+      try {
+        const created = await api.createNode({
+          parent_id: parentId,
+          text: "",
+          after_id: id, // ✅ 后端已支持：直接插到 id 后面，彻底消灭 moveNode
+        });
 
-    try {
-      await api.deleteNode(id);
-    } catch (e) {
-      if (!isHttp404(e)) {
-        console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
+        if (get().sessionNonce !== nonce) return;
+
+        // 3) 用真实 id 替换 temp id
+        set((s) => {
+          const p = s.nodes[parentId];
+          const tmp = s.nodes[tempId];
+          if (!p || !tmp) return s;
+
+          const nextNodes: Record<string, UiNode> = { ...s.nodes };
+
+          // 删除 temp，写入 real
+          delete nextNodes[tempId];
+          nextNodes[created.id] = {
+            ...tmp,
+            id: created.id,
+            parentId: created.parent_id,
+            orderIndex: created.order_index ?? tmp.orderIndex,
+            content: tmp.content ?? "",
+          };
+
+          nextNodes[parentId] = {
+            ...p,
+            children: replaceInArray(p.children, tempId, created.id),
+            hasChildren: true,
+          };
+
+          const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+
+          return {
+            nodes: reordered ?? nextNodes,
+            focusedId: s.focusedId === tempId ? created.id : s.focusedId,
+            caretToEndId: s.caretToEndId === tempId ? created.id : s.caretToEndId,
+          };
+        });
+
+        get().bumpSidebar();
+
+        // 4) 后台校准 children（不阻塞）
+        void get().loadChildren(parentId).catch(console.error);
+      } catch (e) {
+        console.error("[createAfter] create failed:", safeGetErrorMessage(e));
+
+        // 失败：后台校准（并可选择把 temp 留着当离线草稿）
+        void get().loadChildren(parentId).catch(console.error);
       }
-    }
+    })();
+  },
 
-    if (get().sessionNonce !== nonce) return;
+  /**
+   * ✅✅ 根治 Delete 延迟：
+   * - 本地先删 + 先 focus
+   * - 后台 delete，失败就 reload 校准
+   */
+  deleteIfEmpty: async (id) => {
+    const st0 = get();
+    const nonce = st0.sessionNonce;
 
-    await st.loadChildren(node.parentId);
+    const node = st0.nodes[id];
+    const parentId = node?.parentId;
+    if (!node || !parentId) return;
 
+    const parent = st0.nodes[parentId];
+    if (!parent) return;
+
+    // 只有在真的空内容才删（安全）
+    if (!normalizeHtmlEmpty(node.content)) return;
+
+    const idx = parent.children.indexOf(id);
+    const fallbackFocus =
+      (idx > 0 ? parent.children[idx - 1] : parent.children[idx + 1]) ?? parentId;
+
+    // 1) 本地立即删除
     set((s) => {
-      const next = { ...s.nodes };
+      const p = s.nodes[parentId];
+      if (!p) return s;
+
+      const nextNodes: Record<string, UiNode> = { ...s.nodes };
+      delete nextNodes[id];
+
       const nextPending = { ...s.pendingText };
-      delete next[id];
       delete nextPending[id];
-      return { nodes: next, pendingText: nextPending };
+
+      nextNodes[parentId] = {
+        ...p,
+        children: removeFromArray(p.children, id),
+        hasChildren: p.children.length - 1 > 0,
+      };
+
+      const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+
+      return {
+        nodes: reordered ?? nextNodes,
+        pendingText: nextPending,
+        focusedId: fallbackFocus,
+        caretToEndId: fallbackFocus,
+      };
     });
 
     get().bumpSidebar();
+
+    // 2) 后台删
+    void (async () => {
+      try {
+        await api.deleteNode(id);
+        if (get().sessionNonce !== nonce) return;
+        // 后台校准
+        void get().loadChildren(parentId).catch(console.error);
+      } catch (e) {
+        if (!isHttp404(e)) {
+          console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
+        }
+        // 失败就校准
+        void get().loadChildren(parentId).catch(console.error);
+      }
+    })();
   },
 
+  /**
+   * ✅✅ 根治 Tab 延迟（indent）：
+   * - 本地先算新 parent 并移动
+   * - 后台 indentNode
+   * - 失败就 reload 校准
+   */
   indent: async (id) => {
-    const nonce = get().sessionNonce;
-    const before = get().nodes[id];
-    if (!before) return;
+    const st0 = get();
+    const nonce = st0.sessionNonce;
 
-    const oldParentId = before.parentId;
-    const keepText = before.content;
+    const node = st0.nodes[id];
+    if (!node) return;
 
-    let updated: ApiNode;
-    try {
-      updated = await api.indentNode(id);
-    } catch (e) {
-      console.error("[indent] failed:", safeGetErrorMessage(e));
-      return;
-    }
+    const oldParentId = node.parentId;
+    if (!oldParentId) return;
 
-    if (get().sessionNonce !== nonce) return;
+    const oldParent = st0.nodes[oldParentId];
+    if (!oldParent) return;
 
-    const newParentId = updated.parent_id!;
+    const idx = oldParent.children.indexOf(id);
+    if (idx <= 0) return; // 没有前一个兄弟，无法缩进
+
+    const newParentId = oldParent.children[idx - 1];
+    const newParent = st0.nodes[newParentId];
+    if (!newParent) return;
+
+    // 1) 本地立即移动
     set((s) => {
-      const nextNodes = { ...s.nodes };
-      nextNodes[id] = upsertFromApi(s as any, updated);
-      nextNodes[id] = { ...nextNodes[id], content: s.pendingText[id] ?? keepText };
+      const op = s.nodes[oldParentId];
+      const np = s.nodes[newParentId];
+      const n = s.nodes[id];
+      if (!op || !np || !n) return s;
 
-      const p = nextNodes[newParentId];
-      if (p) nextNodes[newParentId] = { ...p, isCollapsed: false };
+      const nextNodes: Record<string, UiNode> = { ...s.nodes };
 
-      return { nodes: nextNodes };
+      nextNodes[oldParentId] = {
+        ...op,
+        children: removeFromArray(op.children, id),
+        hasChildren: op.children.length - 1 > 0,
+      };
+
+      nextNodes[newParentId] = {
+        ...np,
+        children: [...np.children, id],
+        hasChildren: true,
+        isCollapsed: false,
+      };
+
+      nextNodes[id] = { ...n, parentId: newParentId };
+
+      const s1 = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, oldParentId);
+      const s2 = recomputeOrderIndices({ ...s, nodes: s1 ?? nextNodes } as any, newParentId);
+
+      return {
+        nodes: s2 ?? s1 ?? nextNodes,
+        focusedId: id,
+      };
     });
 
-    await get().loadChildren(newParentId);
-
-    if (oldParentId) {
-      await get().loadChildren(oldParentId);
-    }
-
     get().bumpSidebar();
+
+    // 2) 后台同步
+    void (async () => {
+      try {
+        await api.indentNode(id);
+        if (get().sessionNonce !== nonce) return;
+
+        // 后台校准（不阻塞）
+        void get().loadChildren(newParentId).catch(console.error);
+        void get().loadChildren(oldParentId).catch(console.error);
+      } catch (e) {
+        console.error("[indent] failed:", safeGetErrorMessage(e));
+        // 失败就校准
+        void get().loadChildren(oldParentId).catch(console.error);
+        void get().loadChildren(newParentId).catch(console.error);
+      }
+    })();
   },
 
+  /**
+   * ✅✅ 根治 Tab 延迟（outdent）：
+   * - 本地把节点移到 grandParent（插在 parent 后面）
+   * - 后台 outdentNode
+   * - 失败就 reload 校准
+   */
   outdent: async (id) => {
-    const nonce = get().sessionNonce;
-    const before = get().nodes[id];
-    if (!before) return;
+    const st0 = get();
+    const nonce = st0.sessionNonce;
 
-    const oldParentId = before.parentId;
-    const keepText = before.content;
+    const node = st0.nodes[id];
+    if (!node) return;
 
-    let updated: ApiNode;
-    try {
-      updated = await api.outdentNode(id);
-    } catch (e) {
-      console.error("[outdent] failed:", safeGetErrorMessage(e));
-      return;
-    }
+    const parentId = node.parentId;
+    if (!parentId) return;
 
-    if (get().sessionNonce !== nonce) return;
+    const parent = st0.nodes[parentId];
+    if (!parent) return;
 
-    const newParentId = updated.parent_id!;
+    const grandParentId = parent.parentId;
+    if (!grandParentId) return; // parent 已经是 root 级，无法反缩进
+
+    const grand = st0.nodes[grandParentId];
+    if (!grand) return;
+
+    // 在 grandParent.children 里插到 parent 后面
+    const afterId = parentId;
+
+    // 1) 本地立即移动
     set((s) => {
-      const nextNodes = { ...s.nodes };
-      nextNodes[id] = upsertFromApi(s as any, updated);
-      nextNodes[id] = { ...nextNodes[id], content: s.pendingText[id] ?? keepText };
+      const p = s.nodes[parentId];
+      const g = s.nodes[grandParentId];
+      const n = s.nodes[id];
+      if (!p || !g || !n) return s;
 
-      const p = nextNodes[newParentId];
-      if (p) nextNodes[newParentId] = { ...p, isCollapsed: false };
+      const nextNodes: Record<string, UiNode> = { ...s.nodes };
 
-      return { nodes: nextNodes };
+      nextNodes[parentId] = {
+        ...p,
+        children: removeFromArray(p.children, id),
+        hasChildren: p.children.length - 1 > 0,
+      };
+
+      nextNodes[grandParentId] = {
+        ...g,
+        children: insertAfter(g.children, afterId, id),
+        hasChildren: true,
+        isCollapsed: false,
+      };
+
+      nextNodes[id] = { ...n, parentId: grandParentId };
+
+      const s1 = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+      const s2 = recomputeOrderIndices({ ...s, nodes: s1 ?? nextNodes } as any, grandParentId);
+
+      return {
+        nodes: s2 ?? s1 ?? nextNodes,
+        focusedId: id,
+      };
     });
 
-    await get().loadChildren(newParentId);
-
-    if (oldParentId) {
-      await get().loadChildren(oldParentId);
-    }
-
     get().bumpSidebar();
+
+    // 2) 后台同步
+    void (async () => {
+      try {
+        await api.outdentNode(id);
+        if (get().sessionNonce !== nonce) return;
+
+        void get().loadChildren(parentId).catch(console.error);
+        void get().loadChildren(grandParentId).catch(console.error);
+      } catch (e) {
+        console.error("[outdent] failed:", safeGetErrorMessage(e));
+        void get().loadChildren(parentId).catch(console.error);
+        void get().loadChildren(grandParentId).catch(console.error);
+      }
+    })();
   },
 
   moveFocusUp: () => {},

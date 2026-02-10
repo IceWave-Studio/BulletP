@@ -21,7 +21,7 @@ export type ApiTreeNode = ApiNode & {
 /** ---------- Auth ---------- */
 export type EmailStartRes = {
   ok: boolean;
-  expires_in?: number; // 兼容：你后端目前返回 {"ok": true}，这里设为可选
+  expires_in?: number;
 };
 
 export type EmailVerifyRes = {
@@ -33,22 +33,17 @@ export type EmailVerifyRes = {
  * Config
  * ========================= */
 
-// 本地默认走 Vite proxy（API_BASE=""）
-// 生产环境可用 VITE_API_BASE=https://xxx
 const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? "";
 
 /** =========================
  * Helpers
  * ========================= */
 
-// ✅ 从 Zustand store 读取当前 userId（唯一事实源）
 function getCurrentUserId(): string | null {
   return useStore.getState().userId;
 }
 
-// 对需要“用户隔离”的 API 自动拼 user_id
 function withUserId(path: string): string {
-  // ❌ auth / dev 接口不需要 user_id
   if (path.startsWith("/api/auth/") || path.startsWith("/api/dev/")) {
     return path;
   }
@@ -81,7 +76,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const finalPath = withUserId(path);
   const url = `${API_BASE}${finalPath}`;
 
-  // ✅ 只在有 body 时设置 Content-Type，避免 GET 触发 preflight
   const headers: Record<string, string> = {
     ...(init?.headers as any),
   };
@@ -100,7 +94,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(`HTTP ${res.status} ${url}${body ? ` :: ${body}` : ""}`);
   }
 
-  // 204 No Content
   if (res.status === 204) return undefined as T;
 
   const ct = res.headers.get("content-type") || "";
@@ -144,7 +137,7 @@ export const api = {
     request<ApiTreeNode>(`/api/nodes/${rootId}/subtree?depth=${depth}`),
 
   /* ---------- CRUD ---------- */
-  // ✅ 根治：支持 after_id（后端已实现）
+  // ✅ 支持 after_id（后端已实现）
   createNode: (payload: { parent_id?: string | null; text: string; after_id?: string | null }) =>
     request<ApiNode>("/api/nodes", {
       method: "POST",

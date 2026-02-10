@@ -75,27 +75,22 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const lastCommittedRef = useRef<string>("");
   const composingRef = useRef(false);
 
-  // ✅ 不能 early return 在 hooks 前，所以这里用派生变量保护
   const isFocused = focusedId === id;
   const hasChildren =
     ((node?.hasChildren ?? false) || (node?.children?.length ?? 0) > 0) && !!node;
 
-  // ====== 关键修复：聚焦时如果 DOM 是空的，也要灌回 store 内容 ======
   useEffect(() => {
     const el = editorRef.current;
     if (!el) return;
 
     const html = node?.content ?? "";
 
-    // 非聚焦：正常同步
     if (!isFocused) {
       if (el.innerHTML !== html) el.innerHTML = html;
       lastCommittedRef.current = html;
       return;
     }
 
-    // 聚焦：通常不改 DOM，避免打断输入
-    // 但如果这是“重挂载/移动后”的新 DOM，innerHTML 可能是空的 → 必须写回
     const domEmpty =
       el.innerHTML === "" ||
       el.innerHTML === "<br>" ||
@@ -104,8 +99,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     if (domEmpty && cleanupZwsp(html).trim() !== "") {
       el.innerHTML = html;
       lastCommittedRef.current = html;
-
-      // 你可以选择把光标放末尾（Tab 缩进后体验更像 WorkFlowy）
       requestAnimationFrame(() => moveCaretToEnd(el));
     }
   }, [node?.content, isFocused]);
@@ -154,7 +147,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     }, 120);
   };
 
-  // ✅ 渲染时再判空
   if (!node) return null;
 
   const bulletCollapsed = hasChildren && !!node.isCollapsed;
