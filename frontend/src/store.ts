@@ -65,6 +65,9 @@ type Store = {
   // ✅ pending text to prevent older fetches overriding local edit
   pendingText: Record<string, string | undefined>;
 
+  // ✅ NEW: 防乱序 PATCH 回包（旧回包不得覆盖新内容）
+  pendingTextRev: Record<string, number | undefined>;
+
   updateContent: (id: string, html: string) => Promise<void>;
 
   appendChild: (parentId: string) => Promise<void>;
@@ -237,6 +240,7 @@ export const useStore = create<Store>((set, get) => ({
 
       nodes: {},
       pendingText: {},
+      pendingTextRev: {},
       _inflightNodeFetch: {},
       sidebarVersion: 0,
       caretToEndId: null,
@@ -252,6 +256,7 @@ export const useStore = create<Store>((set, get) => ({
       homeId: null,
       nodes: {},
       pendingText: {},
+      pendingTextRev: {},
       rootId: "",
       focusedId: null,
       caretToEndId: null,
@@ -264,6 +269,7 @@ export const useStore = create<Store>((set, get) => ({
   // ===== data =====
   nodes: {},
   pendingText: {},
+  pendingTextRev: {},
 
   rootId: "",
   focusedId: null,
@@ -456,19 +462,27 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   /**
-   * ✅ updateContent 已经是 optimistic，不会阻塞交互
+   * ✅✅ 根治“丢字 / 冒字”：
+   * - optimistic + pendingText（你已有）
+   * - NEW: pendingTextRev 防止乱序 PATCH 回包覆盖新内容
    */
   updateContent: async (id, html) => {
     if (!id) return;
 
     const nonce = get().sessionNonce;
+    let myRev = 0;
 
     set((s) => {
       const n = s.nodes[id];
       if (!n) return s;
+
+      const prev = s.pendingTextRev[id] ?? 0;
+      myRev = prev + 1;
+
       return {
         nodes: { ...s.nodes, [id]: { ...n, content: html } },
         pendingText: { ...s.pendingText, [id]: html },
+        pendingTextRev: { ...s.pendingTextRev, [id]: myRev },
       };
     });
 
@@ -479,17 +493,24 @@ export const useStore = create<Store>((set, get) => ({
       if (get().sessionNonce !== nonce) return;
 
       set((s) => {
+        // ✅ 不是当前最新 rev 的回包，一律丢弃
+        if ((s.pendingTextRev[id] ?? 0) !== myRev) return s;
+
         const nextPending = { ...s.pendingText };
+        const nextRev = { ...s.pendingTextRev };
         delete nextPending[id];
+        delete nextRev[id];
 
         const existing = s.nodes[id];
         return {
           pendingText: nextPending,
+          pendingTextRev: nextRev,
           nodes: { ...s.nodes, [id]: mergeTextOnly(existing, updated) },
         };
       });
     } catch (e) {
       console.error("[updateContent] failed:", safeGetErrorMessage(e));
+      // 不清 pending / rev：让本地仍然作为真相，避免回滚
     }
   },
 
@@ -598,10 +619,25 @@ export const useStore = create<Store>((set, get) => ({
             hasChildren: true,
           };
 
+          // ✅ 迁移 pendingText / pendingTextRev（极端情况下 temp 已经有输入）
+          const nextPending = { ...s.pendingText };
+          if (nextPending[tempId] !== undefined) {
+            nextPending[created.id] = nextPending[tempId];
+            delete nextPending[tempId];
+          }
+
+          const nextRev = { ...s.pendingTextRev };
+          if (nextRev[tempId] !== undefined) {
+            nextRev[created.id] = nextRev[tempId];
+            delete nextRev[tempId];
+          }
+
           const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
 
           return {
             nodes: reordered ?? nextNodes,
+            pendingText: nextPending,
+            pendingTextRev: nextRev,
             focusedId: s.focusedId === tempId ? created.id : s.focusedId,
             caretToEndId: s.caretToEndId === tempId ? created.id : s.caretToEndId,
           };
@@ -613,8 +649,6 @@ export const useStore = create<Store>((set, get) => ({
         void get().loadChildren(parentId).catch(console.error);
       } catch (e) {
         console.error("[createAfter] create failed:", safeGetErrorMessage(e));
-
-        // 失败：后台校准（并可选择把 temp 留着当离线草稿）
         void get().loadChildren(parentId).catch(console.error);
       }
     })();
@@ -654,6 +688,9 @@ export const useStore = create<Store>((set, get) => ({
       const nextPending = { ...s.pendingText };
       delete nextPending[id];
 
+      const nextRev = { ...s.pendingTextRev };
+      delete nextRev[id];
+
       nextNodes[parentId] = {
         ...p,
         children: removeFromArray(p.children, id),
@@ -665,6 +702,7 @@ export const useStore = create<Store>((set, get) => ({
       return {
         nodes: reordered ?? nextNodes,
         pendingText: nextPending,
+        pendingTextRev: nextRev,
         focusedId: fallbackFocus,
         caretToEndId: fallbackFocus,
       };
@@ -677,13 +715,11 @@ export const useStore = create<Store>((set, get) => ({
       try {
         await api.deleteNode(id);
         if (get().sessionNonce !== nonce) return;
-        // 后台校准
         void get().loadChildren(parentId).catch(console.error);
       } catch (e) {
         if (!isHttp404(e)) {
           console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
         }
-        // 失败就校准
         void get().loadChildren(parentId).catch(console.error);
       }
     })();
@@ -756,12 +792,10 @@ export const useStore = create<Store>((set, get) => ({
         await api.indentNode(id);
         if (get().sessionNonce !== nonce) return;
 
-        // 后台校准（不阻塞）
         void get().loadChildren(newParentId).catch(console.error);
         void get().loadChildren(oldParentId).catch(console.error);
       } catch (e) {
         console.error("[indent] failed:", safeGetErrorMessage(e));
-        // 失败就校准
         void get().loadChildren(oldParentId).catch(console.error);
         void get().loadChildren(newParentId).catch(console.error);
       }
