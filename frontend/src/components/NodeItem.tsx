@@ -66,13 +66,35 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ✅ 只在 mount/节点切换时写一次 DOM，避免“输入被回写打断”
+  /**
+   * ✅ DOM 同步策略（关键）：
+   * - 非聚焦：DOM 必须跟 store 对齐（否则 loadChildren / server 校准会出现“闪一下/重复节点/焦点丢”）
+   * - 聚焦：不回写 DOM（避免“输入被回写打断/内容消失”）
+   */
   useEffect(() => {
     const el = editorRef.current;
     if (!el || !node) return;
-    el.innerHTML = node.content ?? "";
-    lastCommittedRef.current = node.content ?? "";
-  }, [id]); // 只依赖 id
+
+    const html = node.content ?? "";
+
+    if (!isFocused) {
+      if (el.innerHTML !== html) el.innerHTML = html;
+      lastCommittedRef.current = html;
+      return;
+    }
+
+    // 聚焦时：只在 DOM 为空且 store 有内容时回灌一次（防止重挂载空白）
+    const domEmpty =
+      el.innerHTML === "" ||
+      el.innerHTML === "<br>" ||
+      cleanupZwsp(el.innerHTML).trim() === "";
+
+    if (domEmpty && cleanupZwsp(html).trim() !== "") {
+      el.innerHTML = html;
+      lastCommittedRef.current = html;
+      requestAnimationFrame(() => moveCaretToEnd(el));
+    }
+  }, [node?.content, isFocused, id]);
 
   useEffect(() => {
     if (!isFocused) return;
@@ -82,6 +104,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   useEffect(() => {
     if (!isFocused) return;
     if (caretToEndId !== id) return;
+
     const el = editorRef.current;
     if (!el) return;
 
@@ -103,7 +126,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   };
 
   const scheduleFlush = () => {
-    // ✅ temp：用 rAF 合并 flush（避免每键 setState 抖动）
+    // temp：用 rAF 合并 flush（避免每键 setState 抖动），但又不会丢字
     if (isTemp) {
       if (rafFlushRef.current) return;
       rafFlushRef.current = requestAnimationFrame(() => {
@@ -194,8 +217,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
             }}
             onInput={scheduleFlush}
             onKeyDown={(e) => {
-              const ime =
-                composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
+              const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
 
               if (e.key === "Enter") {
                 if (ime) return;
