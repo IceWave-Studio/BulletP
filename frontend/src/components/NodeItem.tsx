@@ -75,12 +75,11 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const lastCommittedRef = useRef<string>("");
   const composingRef = useRef(false);
 
-  // ✅ NEW: DOM 最新快照（只在 onInput 后更新，保证是“已经写入 DOM 的最终值”）
-  const latestDomHtmlRef = useRef<string>("");
-
   const isFocused = focusedId === id;
   const hasChildren =
     ((node?.hasChildren ?? false) || (node?.children?.length ?? 0) > 0) && !!node;
+
+  const isTemp = id.startsWith("tmp_");
 
   useEffect(() => {
     const el = editorRef.current;
@@ -91,7 +90,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     if (!isFocused) {
       if (el.innerHTML !== html) el.innerHTML = html;
       lastCommittedRef.current = html;
-      latestDomHtmlRef.current = cleanupZwsp(el.innerHTML);
       return;
     }
 
@@ -103,8 +101,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     if (domEmpty && cleanupZwsp(html).trim() !== "") {
       el.innerHTML = html;
       lastCommittedRef.current = html;
-      latestDomHtmlRef.current = cleanupZwsp(el.innerHTML);
-
       requestAnimationFrame(() => moveCaretToEnd(el));
     }
   }, [node?.content, isFocused]);
@@ -133,15 +129,11 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     }
   };
 
-  // ✅ 强制把“最新 DOM 快照”提交到 store（解决丢字/冒字核心）
   const flushToStore = () => {
     const el = editorRef.current;
     if (!el) return;
 
-    // 优先使用 latestDomHtmlRef（只在 input 后更新，保证是“最新真实 DOM 值”）
-    // 如果它为空（例如首次 focus），退回读 innerHTML
-    const html = latestDomHtmlRef.current || cleanupZwsp(el.innerHTML);
-
+    const html = cleanupZwsp(el.innerHTML);
     if (html !== lastCommittedRef.current) {
       lastCommittedRef.current = html;
       void updateContent(id, html).catch(console.error);
@@ -149,6 +141,13 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   };
 
   const scheduleFlush = () => {
+    // ✅ temp 节点：必须立即 flush（否则 temp 被替换卸载会丢输入）
+    if (isTemp) {
+      clearPending();
+      flushToStore();
+      return;
+    }
+
     if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
     pendingTimerRef.current = window.setTimeout(() => {
       pendingTimerRef.current = null;
@@ -225,25 +224,15 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
             onCompositionStart={() => (composingRef.current = true)}
             onCompositionEnd={() => {
               composingRef.current = false;
-              // ✅ composition 结束时 DOM 才稳定，把最新快照更新到 ref 再 flush
-              const el = editorRef.current;
-              if (el) latestDomHtmlRef.current = cleanupZwsp(el.innerHTML);
               flushToStore();
             }}
-            onInput={() => {
-              // ✅ input 发生时 DOM 已经更新，把“真实最新”写进 ref
-              const el = editorRef.current;
-              if (el) latestDomHtmlRef.current = cleanupZwsp(el.innerHTML);
-              scheduleFlush();
-            }}
+            onInput={() => scheduleFlush()}
             onKeyDown={(e) => {
               if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
                 e.preventDefault();
                 const el = editorRef.current;
                 if (!el) return;
                 applyBold(el);
-                // bold 会改 DOM，更新 ref 再 flush
-                latestDomHtmlRef.current = cleanupZwsp(el.innerHTML);
                 scheduleFlush();
                 return;
               }
@@ -254,10 +243,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
 
                 e.preventDefault();
                 clearPending();
-
-                // ✅ 关键：Enter 前先提交“最新快照”
                 flushToStore();
-
                 void createAfter(id).catch(console.error);
                 return;
               }
@@ -271,10 +257,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
                 if (plain.length === 0) {
                   e.preventDefault();
                   clearPending();
-
-                  // ✅ 关键：Delete 前也先提交“最新快照”（避免删空后冒字）
                   flushToStore();
-
                   void deleteIfEmpty(id).catch(console.error);
                   return;
                 }
@@ -283,10 +266,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
               if (e.key === "Tab") {
                 e.preventDefault();
                 clearPending();
-
-                // ✅ 关键：缩进/反缩进前先提交“最新快照”
                 flushToStore();
-
                 void (e.shiftKey ? outdent(id) : indent(id)).catch(console.error);
                 return;
               }

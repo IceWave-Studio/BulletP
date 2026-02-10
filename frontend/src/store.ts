@@ -65,8 +65,11 @@ type Store = {
   // ✅ pending text to prevent older fetches overriding local edit
   pendingText: Record<string, string | undefined>;
 
-  // ✅ NEW: 防乱序 PATCH 回包（旧回包不得覆盖新内容）
+  // ✅ 防乱序 PATCH 回包（旧回包不得覆盖新内容）
   pendingTextRev: Record<string, number | undefined>;
+
+  // ✅ tempId -> realId redirect（解决 temp 被替换后仍有 flush/patch）
+  idRedirect: Record<string, string | undefined>;
 
   updateContent: (id: string, html: string) => Promise<void>;
 
@@ -83,6 +86,10 @@ type Store = {
 /* =========================
  * Helpers
  * ========================= */
+
+function isTempId(id: string) {
+  return id.startsWith("tmp_");
+}
 
 function normalizeHasChildren(n: any, existing?: UiNode) {
   const hint = n?.has_children !== undefined ? Boolean(n.has_children) : existing?.hasChildren;
@@ -147,11 +154,9 @@ function mergeTextOnly(existing: UiNode | undefined, updated: ApiNode): UiNode {
 }
 
 function newClientId(): string {
-  // modern browsers ok
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
     return (crypto as any).randomUUID();
   }
-  // fallback
   return `tmp_${Math.random().toString(16).slice(2)}_${Date.now()}`;
 }
 
@@ -193,6 +198,17 @@ function recomputeOrderIndices(state: Store, parentId: string) {
   }
   nextNodes[parentId] = { ...p, hasChildren: children.length > 0 };
   return nextNodes;
+}
+
+function resolveId(state: Store, id: string): string {
+  // follow redirects (temp -> real), prevent loops
+  let cur = id;
+  for (let i = 0; i < 8; i++) {
+    const nxt = state.idRedirect[cur];
+    if (!nxt) break;
+    cur = nxt;
+  }
+  return cur;
 }
 
 /* =========================
@@ -241,6 +257,7 @@ export const useStore = create<Store>((set, get) => ({
       nodes: {},
       pendingText: {},
       pendingTextRev: {},
+      idRedirect: {},
       _inflightNodeFetch: {},
       sidebarVersion: 0,
       caretToEndId: null,
@@ -257,6 +274,7 @@ export const useStore = create<Store>((set, get) => ({
       nodes: {},
       pendingText: {},
       pendingTextRev: {},
+      idRedirect: {},
       rootId: "",
       focusedId: null,
       caretToEndId: null,
@@ -270,6 +288,7 @@ export const useStore = create<Store>((set, get) => ({
   nodes: {},
   pendingText: {},
   pendingTextRev: {},
+  idRedirect: {},
 
   rootId: "",
   focusedId: null,
@@ -325,24 +344,25 @@ export const useStore = create<Store>((set, get) => ({
     const nonce = get().sessionNonce;
     const st = get();
 
-    if (st.nodes[id]?.content !== undefined) return;
+    const rid = resolveId(st, id);
+    if (st.nodes[rid]?.content !== undefined) return;
 
-    if (st._inflightNodeFetch[id]) {
-      await st._inflightNodeFetch[id];
+    if (st._inflightNodeFetch[rid]) {
+      await st._inflightNodeFetch[rid];
       return;
     }
 
     const p = (async () => {
       try {
-        const n = await api.getNode(id);
+        const n = await api.getNode(rid);
         if (get().sessionNonce !== nonce) return;
         st.hydrateNode(n);
       } catch (e) {
         if (isHttp404(e)) {
-          console.warn("[ensureNodeLoaded] node not found:", id);
+          console.warn("[ensureNodeLoaded] node not found:", rid);
           set((s2) => {
             const next = { ...s2.nodes };
-            delete next[id];
+            delete next[rid];
             return { nodes: next };
           });
           return;
@@ -351,14 +371,14 @@ export const useStore = create<Store>((set, get) => ({
       } finally {
         set((s2) => {
           const next = { ...s2._inflightNodeFetch };
-          delete next[id];
+          delete next[rid];
           return { _inflightNodeFetch: next };
         });
       }
     })();
 
     set((s2) => ({
-      _inflightNodeFetch: { ...s2._inflightNodeFetch, [id]: p },
+      _inflightNodeFetch: { ...s2._inflightNodeFetch, [rid]: p },
     }));
 
     await p;
@@ -368,22 +388,24 @@ export const useStore = create<Store>((set, get) => ({
     if (!parentId) return;
 
     const nonce = get().sessionNonce;
+    const st0 = get();
+    const pid = resolveId(st0, parentId);
 
     let rows: ApiNode[];
     try {
-      rows = await api.getChildren(parentId);
+      rows = await api.getChildren(pid);
     } catch (e) {
       if (isHttp404(e)) {
-        console.warn("[loadChildren] parent not found:", parentId);
+        console.warn("[loadChildren] parent not found:", pid);
 
         const st = get();
-        if (st.rootId === parentId && st.homeId) {
+        if (st.rootId === pid && st.homeId) {
           set({ rootId: st.homeId });
         }
 
         set((s) => {
           const next = { ...s.nodes };
-          delete next[parentId];
+          delete next[pid];
           return { nodes: next };
         });
 
@@ -407,9 +429,9 @@ export const useStore = create<Store>((set, get) => ({
         childIds.push(r.id);
       }
 
-      const existingParent = next[parentId];
-      next[parentId] = {
-        id: parentId,
+      const existingParent = next[pid];
+      next[pid] = {
+        id: pid,
         parentId: existingParent?.parentId ?? null,
         content: existingParent?.content ?? "",
         orderIndex: existingParent?.orderIndex ?? 0,
@@ -435,7 +457,7 @@ export const useStore = create<Store>((set, get) => ({
   getPathToRoot: (id) => {
     const { nodes, homeId } = get();
     const path: string[] = [];
-    let cur: string | null = id;
+    let cur: string | null = resolveId(get(), id);
 
     while (cur) {
       path.push(cur);
@@ -447,100 +469,111 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   toggleCollapse: (id) => {
+    const st0 = get();
+    const rid = resolveId(st0, id);
+
     set((s) => {
-      const n = s.nodes[id];
+      const n = s.nodes[rid];
       if (!n) return s;
-      return { nodes: { ...s.nodes, [id]: { ...n, isCollapsed: !n.isCollapsed } } };
+      return { nodes: { ...s.nodes, [rid]: { ...n, isCollapsed: !n.isCollapsed } } };
     });
 
-    const n = get().nodes[id];
+    const n = get().nodes[rid];
     if (n && !n.isCollapsed && n.children.length === 0) {
-      void get().loadChildren(id).catch(console.error);
+      void get().loadChildren(rid).catch(console.error);
     }
 
     get().bumpSidebar();
   },
 
   /**
-   * ✅✅ 根治“丢字 / 冒字”：
-   * - optimistic + pendingText（你已有）
-   * - NEW: pendingTextRev 防止乱序 PATCH 回包覆盖新内容
+   * ✅✅ 根治“丢字 / 冒字 / 404 乱序”：
+   * - idRedirect：tempId late flush 自动写到 realId
+   * - pendingTextRev：旧 PATCH 回包直接丢弃
+   * - 404 node not found：生命周期结束信号，吞掉不回滚
    */
   updateContent: async (id, html) => {
-    if (!id) return;
+    const st0 = get();
+    const rid = resolveId(st0, id);
+    if (!rid) return;
 
     const nonce = get().sessionNonce;
     let myRev = 0;
 
     set((s) => {
-      const n = s.nodes[id];
+      const realId = resolveId(s, id);
+      const n = s.nodes[realId];
       if (!n) return s;
 
-      const prev = s.pendingTextRev[id] ?? 0;
+      const prev = s.pendingTextRev[realId] ?? 0;
       myRev = prev + 1;
 
       return {
-        nodes: { ...s.nodes, [id]: { ...n, content: html } },
-        pendingText: { ...s.pendingText, [id]: html },
-        pendingTextRev: { ...s.pendingTextRev, [id]: myRev },
+        nodes: { ...s.nodes, [realId]: { ...n, content: html } },
+        pendingText: { ...s.pendingText, [realId]: html },
+        pendingTextRev: { ...s.pendingTextRev, [realId]: myRev },
       };
     });
 
     get().bumpSidebar();
 
     try {
-      const updated = await api.patchNode(id, { text: html });
+      const updated = await api.patchNode(rid, { text: html });
       if (get().sessionNonce !== nonce) return;
 
       set((s) => {
-        // ✅ 不是当前最新 rev 的回包，一律丢弃
-        if ((s.pendingTextRev[id] ?? 0) !== myRev) return s;
+        const realId = resolveId(s, id);
+        if ((s.pendingTextRev[realId] ?? 0) !== myRev) return s;
 
         const nextPending = { ...s.pendingText };
         const nextRev = { ...s.pendingTextRev };
-        delete nextPending[id];
-        delete nextRev[id];
+        delete nextPending[realId];
+        delete nextRev[realId];
 
-        const existing = s.nodes[id];
+        const existing = s.nodes[realId];
         return {
           pendingText: nextPending,
           pendingTextRev: nextRev,
-          nodes: { ...s.nodes, [id]: mergeTextOnly(existing, updated) },
+          nodes: { ...s.nodes, [realId]: mergeTextOnly(existing, updated) },
         };
       });
     } catch (e) {
+      // ✅ 404 = 节点生命周期已结束（被 delete / temp 替换 / move），吞掉不回滚
+      if (isHttp404(e)) return;
       console.error("[updateContent] failed:", safeGetErrorMessage(e));
-      // 不清 pending / rev：让本地仍然作为真相，避免回滚
     }
   },
 
   appendChild: async (parentId) => {
-    // 这个不是核心交互（可慢），先不动
     const nonce = get().sessionNonce;
+    const pid = resolveId(get(), parentId);
 
     try {
-      await api.createNode({ parent_id: parentId, text: "" });
+      await api.createNode({ parent_id: pid, text: "" });
     } catch (e) {
       console.error("[appendChild] create failed:", safeGetErrorMessage(e));
       return;
     }
 
     if (get().sessionNonce !== nonce) return;
-    await get().loadChildren(parentId);
+    await get().loadChildren(pid);
   },
 
   /**
-   * ✅✅ 根治 Enter 延迟：
-   * - 本地立即插入一个临时节点（0ms）
-   * - 立即 focus 到临时节点（0ms）
-   * - 后台调用 createNode(after_id)，成功后把临时 id 替换为真实 id
-   * - 后台 loadChildren 校准（不 await，不阻塞）
+   * ✅✅ 根治 Enter 延迟 + “新建后快速输入会消失”
+   * - 本地插 temp（0ms）
+   * - focus temp（0ms）
+   * - 后台 createNode 成功后：
+   *   - 设置 idRedirect[temp] = real（关键）
+   *   - 把 temp 的 content/pendingText/pendingRev 全迁移到 real（关键）
+   *   - children 里把 temp 替换成 real
    */
   createAfter: async (id) => {
     const st0 = get();
     const nonce = st0.sessionNonce;
 
-    const cur = st0.nodes[id];
+    const rid = resolveId(st0, id);
+    const cur = st0.nodes[rid];
     if (!cur) return;
 
     const parentId = cur.parentId ?? st0.homeId;
@@ -569,7 +602,7 @@ export const useStore = create<Store>((set, get) => ({
 
       nextNodes[parentId] = {
         ...p,
-        children: insertAfter(p.children, id, tempId),
+        children: insertAfter(p.children, rid, tempId),
         hasChildren: true,
         isCollapsed: false,
       };
@@ -584,68 +617,103 @@ export const useStore = create<Store>((set, get) => ({
 
     get().bumpSidebar();
 
-    // 2) 后台同步到服务器（绝不 await 阻塞 UI）
+    // 2) 后台同步（不阻塞）
     void (async () => {
       try {
-        const created = await api.createNode({
-          parent_id: parentId,
-          text: "",
-          after_id: id, // ✅ 后端已支持：直接插到 id 后面，彻底消灭 moveNode
-        });
+        // ✅ after_id 必须是后端真实存在的 id；tempId 不允许
+        const afterId = isTempId(rid) ? null : rid;
+
+        let created: ApiNode;
+        try {
+          created = await api.createNode({
+            parent_id: parentId,
+            text: "",
+            ...(afterId ? { after_id: afterId } : {}),
+          });
+        } catch (e) {
+          // ✅ after not found：退化为不带 after_id
+          // ✅ after not found: 退化为不带 after_id
+          const msg = safeGetErrorMessage(e);
+          if (msg.includes("after not found")) {
+            created = await api.createNode({ parent_id: parentId, text: "" });
+          } else {
+            throw e;
+          }
+        }
 
         if (get().sessionNonce !== nonce) return;
 
-        // 3) 用真实 id 替换 temp id
         set((s) => {
           const p = s.nodes[parentId];
           const tmp = s.nodes[tempId];
           if (!p || !tmp) return s;
 
           const nextNodes: Record<string, UiNode> = { ...s.nodes };
+          const nextPending = { ...s.pendingText };
+          const nextRev = { ...s.pendingTextRev };
+          const nextRedirect = { ...s.idRedirect };
 
-          // 删除 temp，写入 real
+          // ✅ 建立 redirect：temp 的任何晚到更新都写入 real
+          nextRedirect[tempId] = created.id;
+
+          // ✅ 把 temp 的最新 store 内容迁移到 real（关键）
+          const tempContent = tmp.content ?? "";
+          const tempPending = nextPending[tempId];
+          const tempRev = nextRev[tempId];
+
+          // 删除 temp node（渲染层会卸载 temp DOM）
           delete nextNodes[tempId];
+
+          // 写入 real node：优先用 pendingText（如果 temp 有未确认内容）
+          const finalContent = tempPending !== undefined ? tempPending : tempContent;
+
           nextNodes[created.id] = {
             ...tmp,
             id: created.id,
             parentId: created.parent_id,
             orderIndex: created.order_index ?? tmp.orderIndex,
-            content: tmp.content ?? "",
+            content: finalContent,
           };
 
+          // parent children 替换 temp -> real
           nextNodes[parentId] = {
             ...p,
             children: replaceInArray(p.children, tempId, created.id),
             hasChildren: true,
           };
 
-          // ✅ 迁移 pendingText / pendingTextRev（极端情况下 temp 已经有输入）
-          const nextPending = { ...s.pendingText };
-          if (nextPending[tempId] !== undefined) {
-            nextPending[created.id] = nextPending[tempId];
+          // 迁移 pendingText/pendingRev
+          if (tempPending !== undefined) {
+            nextPending[created.id] = tempPending;
             delete nextPending[tempId];
           }
-
-          const nextRev = { ...s.pendingTextRev };
-          if (nextRev[tempId] !== undefined) {
-            nextRev[created.id] = nextRev[tempId];
+          if (tempRev !== undefined) {
+            nextRev[created.id] = tempRev;
             delete nextRev[tempId];
           }
 
-          const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+          // ✅ 强制把 real 标记为 pending（避免 loadChildren 覆盖）
+          if (finalContent !== "") {
+            nextPending[created.id] = finalContent;
+            nextRev[created.id] = (nextRev[created.id] ?? 0) + 1;
+          }
+
+          const reordered = recomputeOrderIndices(
+            { ...s, nodes: nextNodes, pendingText: nextPending, pendingTextRev: nextRev } as any,
+            parentId
+          );
 
           return {
             nodes: reordered ?? nextNodes,
             pendingText: nextPending,
             pendingTextRev: nextRev,
+            idRedirect: nextRedirect,
             focusedId: s.focusedId === tempId ? created.id : s.focusedId,
             caretToEndId: s.caretToEndId === tempId ? created.id : s.caretToEndId,
           };
         });
 
         get().bumpSidebar();
-
-        // 4) 后台校准 children（不阻塞）
         void get().loadChildren(parentId).catch(console.error);
       } catch (e) {
         console.error("[createAfter] create failed:", safeGetErrorMessage(e));
@@ -655,54 +723,59 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   /**
-   * ✅✅ 根治 Delete 延迟：
-   * - 本地先删 + 先 focus
-   * - 后台 delete，失败就 reload 校准
+   * ✅✅ 删除空行：本地先删，后台删，失败校准
+   * - 同时清理 pendingTextRev / redirect
    */
   deleteIfEmpty: async (id) => {
     const st0 = get();
     const nonce = st0.sessionNonce;
 
-    const node = st0.nodes[id];
+    const rid = resolveId(st0, id);
+    const node = st0.nodes[rid];
     const parentId = node?.parentId;
     if (!node || !parentId) return;
 
     const parent = st0.nodes[parentId];
     if (!parent) return;
 
-    // 只有在真的空内容才删（安全）
     if (!normalizeHtmlEmpty(node.content)) return;
 
-    const idx = parent.children.indexOf(id);
+    const idx = parent.children.indexOf(rid);
     const fallbackFocus =
       (idx > 0 ? parent.children[idx - 1] : parent.children[idx + 1]) ?? parentId;
 
-    // 1) 本地立即删除
     set((s) => {
       const p = s.nodes[parentId];
       if (!p) return s;
 
       const nextNodes: Record<string, UiNode> = { ...s.nodes };
-      delete nextNodes[id];
+      delete nextNodes[rid];
 
       const nextPending = { ...s.pendingText };
-      delete nextPending[id];
+      delete nextPending[rid];
 
       const nextRev = { ...s.pendingTextRev };
-      delete nextRev[id];
+      delete nextRev[rid];
+
+      const nextRedirect = { ...s.idRedirect };
+      delete nextRedirect[rid];
 
       nextNodes[parentId] = {
         ...p,
-        children: removeFromArray(p.children, id),
+        children: removeFromArray(p.children, rid),
         hasChildren: p.children.length - 1 > 0,
       };
 
-      const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+      const reordered = recomputeOrderIndices(
+        { ...s, nodes: nextNodes, pendingText: nextPending, pendingTextRev: nextRev } as any,
+        parentId
+      );
 
       return {
         nodes: reordered ?? nextNodes,
         pendingText: nextPending,
         pendingTextRev: nextRev,
+        idRedirect: nextRedirect,
         focusedId: fallbackFocus,
         caretToEndId: fallbackFocus,
       };
@@ -710,32 +783,28 @@ export const useStore = create<Store>((set, get) => ({
 
     get().bumpSidebar();
 
-    // 2) 后台删
     void (async () => {
       try {
-        await api.deleteNode(id);
+        await api.deleteNode(rid);
         if (get().sessionNonce !== nonce) return;
         void get().loadChildren(parentId).catch(console.error);
       } catch (e) {
-        if (!isHttp404(e)) {
-          console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
-        }
+        if (!isHttp404(e)) console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
         void get().loadChildren(parentId).catch(console.error);
       }
     })();
   },
 
   /**
-   * ✅✅ 根治 Tab 延迟（indent）：
-   * - 本地先算新 parent 并移动
-   * - 后台 indentNode
-   * - 失败就 reload 校准
+   * ✅ indent：本地移动 + 后台校准
+   * - 所有 id 先 resolve，避免对 tempId 操作
    */
   indent: async (id) => {
     const st0 = get();
     const nonce = st0.sessionNonce;
 
-    const node = st0.nodes[id];
+    const rid = resolveId(st0, id);
+    const node = st0.nodes[rid];
     if (!node) return;
 
     const oldParentId = node.parentId;
@@ -744,54 +813,48 @@ export const useStore = create<Store>((set, get) => ({
     const oldParent = st0.nodes[oldParentId];
     if (!oldParent) return;
 
-    const idx = oldParent.children.indexOf(id);
-    if (idx <= 0) return; // 没有前一个兄弟，无法缩进
+    const idx = oldParent.children.indexOf(rid);
+    if (idx <= 0) return;
 
-    const newParentId = oldParent.children[idx - 1];
+    const newParentId = resolveId(st0, oldParent.children[idx - 1]);
     const newParent = st0.nodes[newParentId];
     if (!newParent) return;
 
-    // 1) 本地立即移动
     set((s) => {
       const op = s.nodes[oldParentId];
       const np = s.nodes[newParentId];
-      const n = s.nodes[id];
+      const n = s.nodes[rid];
       if (!op || !np || !n) return s;
 
       const nextNodes: Record<string, UiNode> = { ...s.nodes };
 
       nextNodes[oldParentId] = {
         ...op,
-        children: removeFromArray(op.children, id),
+        children: removeFromArray(op.children, rid),
         hasChildren: op.children.length - 1 > 0,
       };
 
       nextNodes[newParentId] = {
         ...np,
-        children: [...np.children, id],
+        children: [...np.children, rid],
         hasChildren: true,
         isCollapsed: false,
       };
 
-      nextNodes[id] = { ...n, parentId: newParentId };
+      nextNodes[rid] = { ...n, parentId: newParentId };
 
       const s1 = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, oldParentId);
       const s2 = recomputeOrderIndices({ ...s, nodes: s1 ?? nextNodes } as any, newParentId);
 
-      return {
-        nodes: s2 ?? s1 ?? nextNodes,
-        focusedId: id,
-      };
+      return { nodes: s2 ?? s1 ?? nextNodes, focusedId: rid };
     });
 
     get().bumpSidebar();
 
-    // 2) 后台同步
     void (async () => {
       try {
-        await api.indentNode(id);
+        await api.indentNode(rid);
         if (get().sessionNonce !== nonce) return;
-
         void get().loadChildren(newParentId).catch(console.error);
         void get().loadChildren(oldParentId).catch(console.error);
       } catch (e) {
@@ -803,16 +866,15 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   /**
-   * ✅✅ 根治 Tab 延迟（outdent）：
-   * - 本地把节点移到 grandParent（插在 parent 后面）
-   * - 后台 outdentNode
-   * - 失败就 reload 校准
+   * ✅ outdent：本地移动 + 后台校准
+   * - 所有 id 先 resolve，避免对 tempId 操作
    */
   outdent: async (id) => {
     const st0 = get();
     const nonce = st0.sessionNonce;
 
-    const node = st0.nodes[id];
+    const rid = resolveId(st0, id);
+    const node = st0.nodes[rid];
     if (!node) return;
 
     const parentId = node.parentId;
@@ -822,55 +884,48 @@ export const useStore = create<Store>((set, get) => ({
     if (!parent) return;
 
     const grandParentId = parent.parentId;
-    if (!grandParentId) return; // parent 已经是 root 级，无法反缩进
+    if (!grandParentId) return;
 
     const grand = st0.nodes[grandParentId];
     if (!grand) return;
 
-    // 在 grandParent.children 里插到 parent 后面
     const afterId = parentId;
 
-    // 1) 本地立即移动
     set((s) => {
       const p = s.nodes[parentId];
       const g = s.nodes[grandParentId];
-      const n = s.nodes[id];
+      const n = s.nodes[rid];
       if (!p || !g || !n) return s;
 
       const nextNodes: Record<string, UiNode> = { ...s.nodes };
 
       nextNodes[parentId] = {
         ...p,
-        children: removeFromArray(p.children, id),
+        children: removeFromArray(p.children, rid),
         hasChildren: p.children.length - 1 > 0,
       };
 
       nextNodes[grandParentId] = {
         ...g,
-        children: insertAfter(g.children, afterId, id),
+        children: insertAfter(g.children, afterId, rid),
         hasChildren: true,
         isCollapsed: false,
       };
 
-      nextNodes[id] = { ...n, parentId: grandParentId };
+      nextNodes[rid] = { ...n, parentId: grandParentId };
 
       const s1 = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
       const s2 = recomputeOrderIndices({ ...s, nodes: s1 ?? nextNodes } as any, grandParentId);
 
-      return {
-        nodes: s2 ?? s1 ?? nextNodes,
-        focusedId: id,
-      };
+      return { nodes: s2 ?? s1 ?? nextNodes, focusedId: rid };
     });
 
     get().bumpSidebar();
 
-    // 2) 后台同步
     void (async () => {
       try {
-        await api.outdentNode(id);
+        await api.outdentNode(rid);
         if (get().sessionNonce !== nonce) return;
-
         void get().loadChildren(parentId).catch(console.error);
         void get().loadChildren(grandParentId).catch(console.error);
       } catch (e) {
