@@ -198,17 +198,12 @@ export default function Sidebar({ onSelect, onClose }: Props) {
                 {showArrow ? (r.isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />) : null}
               </button>
 
-              <span style={{ width: 10, height: 10, display: "inline-flex", alignItems: "center" }}>
-                <svg width="10" height="10" viewBox="0 0 8 8" aria-hidden="true">
-                  <circle cx="4" cy="4" r="3" fill="#4B5563" />
-                </svg>
-              </span>
+              {/* ✅ 去掉 bullet：留一个很小的 spacer，让文字不要贴着箭头 */}
+              <span style={{ width: 4, flex: "0 0 auto" }} />
 
               <button
                 onClick={() => {
                   onSelect(r.id);
-                  // ✅ 你如果希望点了就收起 sidebar（尤其小屏体验更好）
-                  // 不想要就删掉这行
                   // onClose?.();
                 }}
                 title={r.text}

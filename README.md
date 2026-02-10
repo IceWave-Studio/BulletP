@@ -19,3 +19,5 @@ Version 1.0.0 released on 4th Feb 2026.
 1. 修复海外地区创建节点/删除节点/缩进延时问题
 
 2. 优化多行内容bullet变形问题
+
+3. 删除 sidebar 的 bullet
