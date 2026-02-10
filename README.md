@@ -5,8 +5,17 @@ A powerful note app
 
 
 # Version log
-Version 1.0.0 released on 4th Feb 2026.
+
+Version 1.0.2 released on 10th Feb 2026.
 
 Version 1.0.1 released on 6th Feb 2026.
 
-Version 1.0.2 released on 
+Version 1.0.0 released on 4th Feb 2026.
+
+# version detail
+
+## Version 1.0.2:
+
+1. 修复海外地区创建节点/删除节点/缩进延时问题
+
+2. 优化多行内容bullet变形问题

@@ -16,6 +16,39 @@ function moveCaretToEnd(el: HTMLElement) {
   sel?.addRange(range);
 }
 
+function applyBold(el: HTMLElement) {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return;
+
+  const range = sel.getRangeAt(0);
+  if (!el.contains(range.commonAncestorContainer)) return;
+
+  if (range.collapsed) {
+    const strong = document.createElement("strong");
+    strong.appendChild(document.createTextNode("\u200B"));
+    range.insertNode(strong);
+
+    const r = document.createRange();
+    r.setStart(strong.firstChild as Text, 1);
+    r.collapse(true);
+
+    sel.removeAllRanges();
+    sel.addRange(r);
+    return;
+  }
+
+  const strong = document.createElement("strong");
+  const frag = range.extractContents();
+  strong.appendChild(frag);
+  range.insertNode(strong);
+
+  const r = document.createRange();
+  r.setStartAfter(strong);
+  r.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
 export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const node = useStore((s) => s.nodes[id]);
 
@@ -39,43 +72,35 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const editorRef = useRef<HTMLDivElement | null>(null);
 
   const pendingTimerRef = useRef<number | null>(null);
-  const rafFlushRef = useRef<number | null>(null);
-
   const lastCommittedRef = useRef<string>("");
   const composingRef = useRef(false);
 
   const isFocused = focusedId === id;
-  const isTemp = id.startsWith("tmp_");
-
   const hasChildren =
     ((node?.hasChildren ?? false) || (node?.children?.length ?? 0) > 0) && !!node;
+
+  const isTemp = id.startsWith("tmp_");
 
   const clearPending = () => {
     if (pendingTimerRef.current) {
       window.clearTimeout(pendingTimerRef.current);
       pendingTimerRef.current = null;
     }
-    if (rafFlushRef.current) {
-      cancelAnimationFrame(rafFlushRef.current);
-      rafFlushRef.current = null;
-    }
   };
 
+  // ✅ 组件卸载时清 timer
   useEffect(() => {
-    return () => clearPending();
+    return () => {
+      clearPending();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /**
-   * ✅ DOM 同步策略（关键）：
-   * - 非聚焦：DOM 必须跟 store 对齐（否则 loadChildren / server 校准会出现“闪一下/重复节点/焦点丢”）
-   * - 聚焦：不回写 DOM（避免“输入被回写打断/内容消失”）
-   */
   useEffect(() => {
     const el = editorRef.current;
-    if (!el || !node) return;
+    if (!el) return;
 
-    const html = node.content ?? "";
+    const html = node?.content ?? "";
 
     if (!isFocused) {
       if (el.innerHTML !== html) el.innerHTML = html;
@@ -83,7 +108,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
       return;
     }
 
-    // 聚焦时：只在 DOM 为空且 store 有内容时回灌一次（防止重挂载空白）
     const domEmpty =
       el.innerHTML === "" ||
       el.innerHTML === "<br>" ||
@@ -94,7 +118,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
       lastCommittedRef.current = html;
       requestAnimationFrame(() => moveCaretToEnd(el));
     }
-  }, [node?.content, isFocused, id]);
+  }, [node?.content, isFocused]);
 
   useEffect(() => {
     if (!isFocused) return;
@@ -104,7 +128,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   useEffect(() => {
     if (!isFocused) return;
     if (caretToEndId !== id) return;
-
     const el = editorRef.current;
     if (!el) return;
 
@@ -121,19 +144,15 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     const html = cleanupZwsp(el.innerHTML);
     if (html !== lastCommittedRef.current) {
       lastCommittedRef.current = html;
-      void updateContent(id, html);
+      void updateContent(id, html).catch(console.error);
     }
   };
 
   const scheduleFlush = () => {
-    // temp：用 rAF 合并 flush（避免每键 setState 抖动），但又不会丢字
+    // ✅ temp 节点立即 flush，防止 temp->real 替换时丢输入
     if (isTemp) {
-      if (rafFlushRef.current) return;
-      rafFlushRef.current = requestAnimationFrame(() => {
-        rafFlushRef.current = null;
-        if (composingRef.current) return;
-        flushToStore();
-      });
+      clearPending();
+      flushToStore();
       return;
     }
 
@@ -155,13 +174,15 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
         className="bp-row"
         style={{
           display: "flex",
-          alignItems: "center",
+          alignItems: "flex-start", // ✅ 多行时左侧只对齐第一行
           gap: 8,
           paddingLeft: level * 28,
           margin: "6px 0",
         }}
       >
+        {/* Chevron */}
         <div
+          className="bp-left-icon"
           style={{
             width: 18,
             height: 18,
@@ -170,7 +191,8 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
             justifyContent: "center",
             color: "#D1D5DB",
             cursor: hasChildren ? "pointer" : "default",
-            flex: "0 0 auto",
+            flex: "0 0 18px", // ✅ 固定宽度，避免被挤压
+            marginTop: 2, // ✅ 视觉上更贴近第一行文字
           }}
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => hasChildren && toggleCollapse(id)}
@@ -182,8 +204,18 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           )}
         </div>
 
+        {/* Bullet */}
         <div
           className={`bp-bullet-wrap ${bulletCollapsed ? "bp-bullet-collapsed" : ""}`}
+          style={{
+            flex: "0 0 16px", // ✅ 固定尺寸，不 shrink
+            width: 16,
+            height: 16,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            marginTop: 3, // ✅ 对齐第一行的 baseline（按字体可微调 2~4）
+          }}
           onMouseDown={(e) => e.preventDefault()}
           onClick={(e) => {
             e.stopPropagation();
@@ -191,11 +223,24 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           }}
           title="Zoom In"
         >
-          <svg width="12" height="12" viewBox="0 0 8 8" className="bp-bullet-dot" aria-hidden="true">
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 8 8"
+            className="bp-bullet-dot"
+            aria-hidden="true"
+            style={{
+              width: 12,
+              height: 12,
+              flex: "0 0 auto", // ✅ 防止 svg 被压缩
+              display: "block",
+            }}
+          >
             <circle cx="4" cy="4" r="3" />
           </svg>
         </div>
 
+        {/* Editor */}
         <div style={{ flex: "1 1 auto", minWidth: 0 }}>
           <div
             ref={editorRef}
@@ -203,7 +248,11 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
             suppressContentEditableWarning
             spellCheck={false}
             className="bp-editor"
-            style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+            style={{
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              lineHeight: "1.5", // ✅ 统一多行高度，让对齐更稳定
+            }}
             onFocus={() => setFocusedId(id)}
             onBlur={() => {
               clearPending();
@@ -215,28 +264,39 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
               composingRef.current = false;
               flushToStore();
             }}
-            onInput={scheduleFlush}
+            onInput={() => scheduleFlush()}
             onKeyDown={(e) => {
-              const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
+              if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+                e.preventDefault();
+                const el = editorRef.current;
+                if (!el) return;
+                applyBold(el);
+                scheduleFlush();
+                return;
+              }
 
               if (e.key === "Enter") {
+                const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
                 if (ime) return;
+
                 e.preventDefault();
                 clearPending();
                 flushToStore();
-                void createAfter(id);
+                void createAfter(id).catch(console.error);
                 return;
               }
 
               if (e.key === "Backspace") {
+                const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
                 if (ime) return;
+
                 const el = editorRef.current;
                 const plain = (el?.innerText || "").replace(/\u200B/g, "").trim();
                 if (plain.length === 0) {
                   e.preventDefault();
                   clearPending();
                   flushToStore();
-                  void deleteIfEmpty(id);
+                  void deleteIfEmpty(id).catch(console.error);
                   return;
                 }
               }
@@ -245,7 +305,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
                 e.preventDefault();
                 clearPending();
                 flushToStore();
-                void (e.shiftKey ? outdent(id) : indent(id));
+                void (e.shiftKey ? outdent(id) : indent(id)).catch(console.error);
                 return;
               }
 

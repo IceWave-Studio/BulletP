@@ -10,6 +10,30 @@
 }
 
 /* ===============================
+   ✅ 多行对齐修复（bullet 只对齐第一行）
+   =============================== */
+.bp-row {
+  align-items: flex-start; /* 关键：多行时左侧 icon / bullet 不要垂直居中 */
+}
+
+/* 左侧 icon / bullet 永远不被挤压 */
+.bp-left-icon,
+.bp-bullet-wrap,
+.bp-bullet-dot {
+  flex-shrink: 0;
+}
+
+/* chevron 容器：固定尺寸，且对齐到第一行 */
+.bp-left-icon {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px; /* 让 chevron 更贴近第一行 baseline（按需 1~4px 微调） */
+}
+
+/* ===============================
    contentEditable 基础清理
    =============================== */
 .bp-editor,
@@ -75,6 +99,9 @@
   transition: background-color 120ms ease;
 
   cursor: pointer;
+
+  /* ✅ 多行时让 bullet 贴第一行（按你当前 20/32 的字体很合适） */
+  margin-top: 4px; /* 按需 2~6px 微调，目标是让圆点与第一行看起来“在同一行” */
 }
 
 /* ✅ 有子项 且 折叠：常驻浅灰背景 */
@@ -92,7 +119,9 @@
    =============================== */
 .bp-bullet-dot {
   display: block;
-  fill: #4B5563;                           /* gray-600，永远固定 */
+  width: 12px;     /* ✅ 固定，防止被压缩 */
+  height: 12px;    /* ✅ 固定，防止被压缩 */
+  fill: #4B5563;   /* gray-600，永远固定 */
 }
 
 /* ===============================
