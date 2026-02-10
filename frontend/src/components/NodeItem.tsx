@@ -3,6 +3,10 @@ import { useEffect, useRef } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useStore } from "../store";
 
+/* =========================
+ * Utils
+ * ========================= */
+
 function cleanupZwsp(html: string) {
   return html.replace(/\u200B/g, "");
 }
@@ -16,38 +20,9 @@ function moveCaretToEnd(el: HTMLElement) {
   sel?.addRange(range);
 }
 
-function applyBold(el: HTMLElement) {
-  const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0) return;
-
-  const range = sel.getRangeAt(0);
-  if (!el.contains(range.commonAncestorContainer)) return;
-
-  if (range.collapsed) {
-    const strong = document.createElement("strong");
-    strong.appendChild(document.createTextNode("\u200B"));
-    range.insertNode(strong);
-
-    const r = document.createRange();
-    r.setStart(strong.firstChild as Text, 1);
-    r.collapse(true);
-
-    sel.removeAllRanges();
-    sel.addRange(r);
-    return;
-  }
-
-  const strong = document.createElement("strong");
-  const frag = range.extractContents();
-  strong.appendChild(frag);
-  range.insertNode(strong);
-
-  const r = document.createRange();
-  r.setStartAfter(strong);
-  r.collapse(true);
-  sel.removeAllRanges();
-  sel.addRange(r);
-}
+/* =========================
+ * Component
+ * ========================= */
 
 export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   const node = useStore((s) => s.nodes[id]);
@@ -73,13 +48,18 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
 
   const pendingTimerRef = useRef<number | null>(null);
   const lastCommittedRef = useRef<string>("");
+
   const composingRef = useRef(false);
 
   const isFocused = focusedId === id;
+  const isTemp = id.startsWith("tmp_");
+
   const hasChildren =
     ((node?.hasChildren ?? false) || (node?.children?.length ?? 0) > 0) && !!node;
 
-  const isTemp = id.startsWith("tmp_");
+  /* =========================
+   * Timer helpers
+   * ========================= */
 
   const clearPending = () => {
     if (pendingTimerRef.current) {
@@ -88,37 +68,26 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     }
   };
 
-  // ✅ 组件卸载时一定要清 timer，否则会出现 late flush -> PATCH 404 / 乱序覆盖
   useEffect(() => {
-    return () => {
-      clearPending();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => clearPending();
   }, []);
+
+  /* =========================
+   * Initial mount: set DOM once
+   * ========================= */
 
   useEffect(() => {
     const el = editorRef.current;
-    if (!el) return;
+    if (!el || !node) return;
 
-    const html = node?.content ?? "";
+    // ✅ 只在首次 mount / 节点切换时写 DOM
+    el.innerHTML = node.content ?? "";
+    lastCommittedRef.current = node.content ?? "";
+  }, [id]); // ❗ 只依赖 id
 
-    if (!isFocused) {
-      if (el.innerHTML !== html) el.innerHTML = html;
-      lastCommittedRef.current = html;
-      return;
-    }
-
-    const domEmpty =
-      el.innerHTML === "" ||
-      el.innerHTML === "<br>" ||
-      cleanupZwsp(el.innerHTML).trim() === "";
-
-    if (domEmpty && cleanupZwsp(html).trim() !== "") {
-      el.innerHTML = html;
-      lastCommittedRef.current = html;
-      requestAnimationFrame(() => moveCaretToEnd(el));
-    }
-  }, [node?.content, isFocused]);
+  /* =========================
+   * Focus handling (NO DOM WRITE)
+   * ========================= */
 
   useEffect(() => {
     if (!isFocused) return;
@@ -128,6 +97,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   useEffect(() => {
     if (!isFocused) return;
     if (caretToEndId !== id) return;
+
     const el = editorRef.current;
     if (!el) return;
 
@@ -137,6 +107,10 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     });
   }, [isFocused, caretToEndId, id, setCaretToEndId]);
 
+  /* =========================
+   * Flush logic
+   * ========================= */
+
   const flushToStore = () => {
     const el = editorRef.current;
     if (!el) return;
@@ -144,19 +118,19 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     const html = cleanupZwsp(el.innerHTML);
     if (html !== lastCommittedRef.current) {
       lastCommittedRef.current = html;
-      void updateContent(id, html).catch(console.error);
+      void updateContent(id, html);
     }
   };
 
   const scheduleFlush = () => {
-    // ✅ temp 节点必须立即 flush，否则 temp->real 替换卸载会丢输入
+    // temp 节点立即 flush，避免被替换时丢输入
     if (isTemp) {
       clearPending();
       flushToStore();
       return;
     }
 
-    if (pendingTimerRef.current) window.clearTimeout(pendingTimerRef.current);
+    clearPending();
     pendingTimerRef.current = window.setTimeout(() => {
       pendingTimerRef.current = null;
       if (composingRef.current) return;
@@ -167,6 +141,10 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   if (!node) return null;
 
   const bulletCollapsed = hasChildren && !!node.isCollapsed;
+
+  /* =========================
+   * Render
+   * ========================= */
 
   return (
     <div className="flex flex-col">
@@ -180,6 +158,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           margin: "6px 0",
         }}
       >
+        {/* Collapse icon */}
         <div
           style={{
             width: 18,
@@ -201,6 +180,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           )}
         </div>
 
+        {/* Bullet */}
         <div
           className={`bp-bullet-wrap ${bulletCollapsed ? "bp-bullet-collapsed" : ""}`}
           onMouseDown={(e) => e.preventDefault()}
@@ -210,11 +190,12 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
           }}
           title="Zoom In"
         >
-          <svg width="12" height="12" viewBox="0 0 8 8" className="bp-bullet-dot" aria-hidden="true">
+          <svg width="12" height="12" viewBox="0 0 8 8" className="bp-bullet-dot">
             <circle cx="4" cy="4" r="3" />
           </svg>
         </div>
 
+        {/* Editor */}
         <div style={{ flex: "1 1 auto", minWidth: 0 }}>
           <div
             ref={editorRef}
@@ -234,39 +215,27 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
               composingRef.current = false;
               flushToStore();
             }}
-            onInput={() => scheduleFlush()}
+            onInput={scheduleFlush}
             onKeyDown={(e) => {
-              if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
-                e.preventDefault();
-                const el = editorRef.current;
-                if (!el) return;
-                applyBold(el);
-                scheduleFlush();
-                return;
-              }
+              const ime =
+                composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
 
-              if (e.key === "Enter") {
-                const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
-                if (ime) return;
-
+              if (e.key === "Enter" && !ime) {
                 e.preventDefault();
                 clearPending();
                 flushToStore();
-                void createAfter(id).catch(console.error);
+                void createAfter(id);
                 return;
               }
 
-              if (e.key === "Backspace") {
-                const ime = composingRef.current || Boolean((e.nativeEvent as any)?.isComposing);
-                if (ime) return;
-
+              if (e.key === "Backspace" && !ime) {
                 const el = editorRef.current;
-                const plain = (el?.innerText || "").replace(/\u200B/g, "").trim();
+                const plain = (el?.innerText || "").trim();
                 if (plain.length === 0) {
                   e.preventDefault();
                   clearPending();
                   flushToStore();
-                  void deleteIfEmpty(id).catch(console.error);
+                  void deleteIfEmpty(id);
                   return;
                 }
               }
@@ -275,7 +244,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
                 e.preventDefault();
                 clearPending();
                 flushToStore();
-                void (e.shiftKey ? outdent(id) : indent(id)).catch(console.error);
+                void (e.shiftKey ? outdent(id) : indent(id));
                 return;
               }
 
