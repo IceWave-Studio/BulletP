@@ -71,6 +71,12 @@ type Store = {
   // ✅ tempId -> realId redirect（解决 temp 被替换后仍有 flush/patch）
   idRedirect: Record<string, string | undefined>;
 
+  // ✅ createAfter 的“创建中”状态：用于“秒删后又复活”的根治
+  pendingCreate: Record<
+    string,
+    { parentId: string; canceled: boolean; createdRealId?: string | null } | undefined
+  >;
+
   updateContent: (id: string, html: string) => Promise<void>;
 
   appendChild: (parentId: string) => Promise<void>;
@@ -153,9 +159,13 @@ function mergeTextOnly(existing: UiNode | undefined, updated: ApiNode): UiNode {
   };
 }
 
+/**
+ * ✅✅ 核心修复：tempId 必须永远带 tmp_ 前缀！
+ * 否则 NodeItem / store 的 temp 判断全部失效 -> 丢输入 / 404 / 复活
+ */
 function newClientId(): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return (crypto as any).randomUUID();
+    return `tmp_${(crypto as any).randomUUID()}`;
   }
   return `tmp_${Math.random().toString(16).slice(2)}_${Date.now()}`;
 }
@@ -201,7 +211,6 @@ function recomputeOrderIndices(state: Store, parentId: string) {
 }
 
 function resolveId(state: Store, id: string): string {
-  // follow redirects (temp -> real), prevent loops
   let cur = id;
   for (let i = 0; i < 8; i++) {
     const nxt = state.idRedirect[cur];
@@ -258,6 +267,7 @@ export const useStore = create<Store>((set, get) => ({
       pendingText: {},
       pendingTextRev: {},
       idRedirect: {},
+      pendingCreate: {},
       _inflightNodeFetch: {},
       sidebarVersion: 0,
       caretToEndId: null,
@@ -275,6 +285,7 @@ export const useStore = create<Store>((set, get) => ({
       pendingText: {},
       pendingTextRev: {},
       idRedirect: {},
+      pendingCreate: {},
       rootId: "",
       focusedId: null,
       caretToEndId: null,
@@ -289,6 +300,7 @@ export const useStore = create<Store>((set, get) => ({
   pendingText: {},
   pendingTextRev: {},
   idRedirect: {},
+  pendingCreate: {},
 
   rootId: "",
   focusedId: null,
@@ -359,7 +371,6 @@ export const useStore = create<Store>((set, get) => ({
         st.hydrateNode(n);
       } catch (e) {
         if (isHttp404(e)) {
-          console.warn("[ensureNodeLoaded] node not found:", rid);
           set((s2) => {
             const next = { ...s2.nodes };
             delete next[rid];
@@ -396,19 +407,15 @@ export const useStore = create<Store>((set, get) => ({
       rows = await api.getChildren(pid);
     } catch (e) {
       if (isHttp404(e)) {
-        console.warn("[loadChildren] parent not found:", pid);
-
         const st = get();
         if (st.rootId === pid && st.homeId) {
           set({ rootId: st.homeId });
         }
-
         set((s) => {
           const next = { ...s.nodes };
           delete next[pid];
           return { nodes: next };
         });
-
         get().bumpSidebar();
         return;
       }
@@ -538,7 +545,6 @@ export const useStore = create<Store>((set, get) => ({
         };
       });
     } catch (e) {
-      // ✅ 404 = 节点生命周期已结束（被 delete / temp 替换 / move），吞掉不回滚
       if (isHttp404(e)) return;
       console.error("[updateContent] failed:", safeGetErrorMessage(e));
     }
@@ -560,13 +566,9 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   /**
-   * ✅✅ 根治 Enter 延迟 + “新建后快速输入会消失”
-   * - 本地插 temp（0ms）
-   * - focus temp（0ms）
-   * - 后台 createNode 成功后：
-   *   - 设置 idRedirect[temp] = real（关键）
-   *   - 把 temp 的 content/pendingText/pendingRev 全迁移到 real（关键）
-   *   - children 里把 temp 替换成 real
+   * ✅✅ 根治 Enter 延迟 + “新建后快速输入消失” + “秒删后复活”
+   * - tempId 永远 tmp_ 前缀（关键地基）
+   * - pendingCreate：允许 delete 取消 create（create 回来后补发 delete）
    */
   createAfter: async (id) => {
     const st0 = get();
@@ -582,9 +584,9 @@ export const useStore = create<Store>((set, get) => ({
     const parent = st0.nodes[parentId];
     if (!parent) return;
 
-    // 1) 本地立即插入 temp node
     const tempId = newClientId();
 
+    // 1) 本地插 temp + 记录 pendingCreate
     set((s) => {
       const p = s.nodes[parentId];
       if (!p) return s;
@@ -608,8 +610,13 @@ export const useStore = create<Store>((set, get) => ({
       };
 
       const reordered = recomputeOrderIndices({ ...s, nodes: nextNodes } as any, parentId);
+
       return {
         nodes: reordered ?? nextNodes,
+        pendingCreate: {
+          ...s.pendingCreate,
+          [tempId]: { parentId, canceled: false, createdRealId: null },
+        },
         focusedId: tempId,
         caretToEndId: tempId,
       };
@@ -617,10 +624,9 @@ export const useStore = create<Store>((set, get) => ({
 
     get().bumpSidebar();
 
-    // 2) 后台同步（不阻塞）
+    // 2) 后台 create（不阻塞）
     void (async () => {
       try {
-        // ✅ after_id 必须是后端真实存在的 id；tempId 不允许
         const afterId = isTempId(rid) ? null : rid;
 
         let created: ApiNode;
@@ -630,9 +636,7 @@ export const useStore = create<Store>((set, get) => ({
             text: "",
             ...(afterId ? { after_id: afterId } : {}),
           });
-        } catch (e) {
-          // ✅ after not found：退化为不带 after_id
-          // ✅ after not found: 退化为不带 after_id
+        } catch (e: any) {
           const msg = safeGetErrorMessage(e);
           if (msg.includes("after not found")) {
             created = await api.createNode({ parent_id: parentId, text: "" });
@@ -643,6 +647,32 @@ export const useStore = create<Store>((set, get) => ({
 
         if (get().sessionNonce !== nonce) return;
 
+        // 2.1) 如果用户已经把 temp 秒删了：直接把服务器创建的 real 删掉，防复活
+        const st1 = get();
+        const pc = st1.pendingCreate[tempId];
+        const tempStillExists = Boolean(st1.nodes[tempId]);
+        const canceled = pc?.canceled === true;
+
+        if (canceled || !tempStillExists) {
+          try {
+            await api.deleteNode(created.id);
+          } catch {
+            // ignore
+          }
+          // 校准 parent children
+          void get().loadChildren(parentId).catch(console.error);
+
+          // 清理 pendingCreate
+          set((s) => {
+            const next = { ...s.pendingCreate };
+            delete next[tempId];
+            return { pendingCreate: next };
+          });
+
+          return;
+        }
+
+        // 2.2) 正常：temp -> real 替换 + redirect + 迁移 pending
         set((s) => {
           const p = s.nodes[parentId];
           const tmp = s.nodes[tempId];
@@ -652,19 +682,17 @@ export const useStore = create<Store>((set, get) => ({
           const nextPending = { ...s.pendingText };
           const nextRev = { ...s.pendingTextRev };
           const nextRedirect = { ...s.idRedirect };
+          const nextPC = { ...s.pendingCreate };
 
-          // ✅ 建立 redirect：temp 的任何晚到更新都写入 real
+          // redirect
           nextRedirect[tempId] = created.id;
 
-          // ✅ 把 temp 的最新 store 内容迁移到 real（关键）
           const tempContent = tmp.content ?? "";
           const tempPending = nextPending[tempId];
           const tempRev = nextRev[tempId];
 
-          // 删除 temp node（渲染层会卸载 temp DOM）
           delete nextNodes[tempId];
 
-          // 写入 real node：优先用 pendingText（如果 temp 有未确认内容）
           const finalContent = tempPending !== undefined ? tempPending : tempContent;
 
           nextNodes[created.id] = {
@@ -675,14 +703,12 @@ export const useStore = create<Store>((set, get) => ({
             content: finalContent,
           };
 
-          // parent children 替换 temp -> real
           nextNodes[parentId] = {
             ...p,
             children: replaceInArray(p.children, tempId, created.id),
             hasChildren: true,
           };
 
-          // 迁移 pendingText/pendingRev
           if (tempPending !== undefined) {
             nextPending[created.id] = tempPending;
             delete nextPending[tempId];
@@ -692,11 +718,8 @@ export const useStore = create<Store>((set, get) => ({
             delete nextRev[tempId];
           }
 
-          // ✅ 强制把 real 标记为 pending（避免 loadChildren 覆盖）
-          if (finalContent !== "") {
-            nextPending[created.id] = finalContent;
-            nextRev[created.id] = (nextRev[created.id] ?? 0) + 1;
-          }
+          // 更新 pendingCreate 记录 realId
+          nextPC[tempId] = { parentId, canceled: false, createdRealId: created.id };
 
           const reordered = recomputeOrderIndices(
             { ...s, nodes: nextNodes, pendingText: nextPending, pendingTextRev: nextRev } as any,
@@ -708,6 +731,7 @@ export const useStore = create<Store>((set, get) => ({
             pendingText: nextPending,
             pendingTextRev: nextRev,
             idRedirect: nextRedirect,
+            pendingCreate: nextPC,
             focusedId: s.focusedId === tempId ? created.id : s.focusedId,
             caretToEndId: s.caretToEndId === tempId ? created.id : s.caretToEndId,
           };
@@ -715,16 +739,31 @@ export const useStore = create<Store>((set, get) => ({
 
         get().bumpSidebar();
         void get().loadChildren(parentId).catch(console.error);
+
+        // 清理 pendingCreate（temp 已被替换，用完即清）
+        set((s) => {
+          const next = { ...s.pendingCreate };
+          delete next[tempId];
+          return { pendingCreate: next };
+        });
       } catch (e) {
         console.error("[createAfter] create failed:", safeGetErrorMessage(e));
         void get().loadChildren(parentId).catch(console.error);
+
+        // 清理 pendingCreate
+        set((s) => {
+          const next = { ...s.pendingCreate };
+          // 如果 temp 仍存在，允许它当草稿；这里只移除 pending 标记
+          // 但不删 temp node
+          return next ? { pendingCreate: next } : s;
+        });
       }
     })();
   },
 
   /**
    * ✅✅ 删除空行：本地先删，后台删，失败校准
-   * - 同时清理 pendingTextRev / redirect
+   * - 对 temp：标记 pendingCreate.canceled，避免“秒删后复活”
    */
   deleteIfEmpty: async (id) => {
     const st0 = get();
@@ -740,10 +779,20 @@ export const useStore = create<Store>((set, get) => ({
 
     if (!normalizeHtmlEmpty(node.content)) return;
 
+    // ✅ 如果删的是 temp：取消 create
+    if (isTempId(id)) {
+      set((s) => {
+        const pc = s.pendingCreate[id];
+        if (!pc) return s;
+        return { pendingCreate: { ...s.pendingCreate, [id]: { ...pc, canceled: true } } };
+      });
+    }
+
     const idx = parent.children.indexOf(rid);
     const fallbackFocus =
       (idx > 0 ? parent.children[idx - 1] : parent.children[idx + 1]) ?? parentId;
 
+    // 1) 本地立即删除
     set((s) => {
       const p = s.nodes[parentId];
       if (!p) return s;
@@ -783,22 +832,21 @@ export const useStore = create<Store>((set, get) => ({
 
     get().bumpSidebar();
 
+    // 2) 后台删除（对 temp：rid 可能不存在 -> 404 吞掉即可；真正的 real 会在 createAfter cancel 分支里删）
     void (async () => {
       try {
         await api.deleteNode(rid);
         if (get().sessionNonce !== nonce) return;
         void get().loadChildren(parentId).catch(console.error);
       } catch (e) {
-        if (!isHttp404(e)) console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
+        if (!isHttp404(e)) {
+          console.error("[deleteIfEmpty] delete failed:", safeGetErrorMessage(e));
+        }
         void get().loadChildren(parentId).catch(console.error);
       }
     })();
   },
 
-  /**
-   * ✅ indent：本地移动 + 后台校准
-   * - 所有 id 先 resolve，避免对 tempId 操作
-   */
   indent: async (id) => {
     const st0 = get();
     const nonce = st0.sessionNonce;
@@ -865,10 +913,6 @@ export const useStore = create<Store>((set, get) => ({
     })();
   },
 
-  /**
-   * ✅ outdent：本地移动 + 后台校准
-   * - 所有 id 先 resolve，避免对 tempId 操作
-   */
   outdent: async (id) => {
     const st0 = get();
     const nonce = st0.sessionNonce;

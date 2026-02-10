@@ -81,6 +81,21 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
 
   const isTemp = id.startsWith("tmp_");
 
+  const clearPending = () => {
+    if (pendingTimerRef.current) {
+      window.clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = null;
+    }
+  };
+
+  // ✅ 组件卸载时一定要清 timer，否则会出现 late flush -> PATCH 404 / 乱序覆盖
+  useEffect(() => {
+    return () => {
+      clearPending();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     const el = editorRef.current;
     if (!el) return;
@@ -122,13 +137,6 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
     });
   }, [isFocused, caretToEndId, id, setCaretToEndId]);
 
-  const clearPending = () => {
-    if (pendingTimerRef.current) {
-      window.clearTimeout(pendingTimerRef.current);
-      pendingTimerRef.current = null;
-    }
-  };
-
   const flushToStore = () => {
     const el = editorRef.current;
     if (!el) return;
@@ -141,7 +149,7 @@ export const NodeItem = ({ id, level = 0 }: { id: string; level?: number }) => {
   };
 
   const scheduleFlush = () => {
-    // ✅ temp 节点：必须立即 flush（否则 temp 被替换卸载会丢输入）
+    // ✅ temp 节点必须立即 flush，否则 temp->real 替换卸载会丢输入
     if (isTemp) {
       clearPending();
       flushToStore();
